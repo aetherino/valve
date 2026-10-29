@@ -15,13 +15,12 @@ from typing import Any, Callable
 from vals_harness.chamber_api import AgentOutcome, Recorder, safe_num
 from vals_harness.errors import ChamberStopped, InfraError
 from vals_harness.sandbox import Sandbox
-from vals_harness.sandbox.docker import _docker
+from vals_harness.sandbox.docker import build_lock, _docker
 from vals_harness.specs import AgentSpec, InstalledRuntime, TrialSpec, folder_digest
 
 WORK = "/tmp/vals"           # outside /workspace, so none of this is part of the submission
 INSTRUCTION = f"{WORK}/instruction.txt"
 STDERR = f"{WORK}/stderr.log"
-WORKSPACE = "/workspace"
 INSTALLED_BUILD_TIMEOUT_S = 1800   # see specs.PREPARE_SLACK_S
 
 
@@ -41,11 +40,12 @@ class InstalledRunner:
         """Build (once) task image + agent runtime; return the new image id."""
         rt = _runtime(agent)
         base, tag = self.base_tag(task_image_id), self.tag_for(agent, task_image_id)
-        if _docker(["image", "inspect", tag], check=False).returncode != 0:
-            _docker(["tag", task_image_id, base])
-            _docker(["build", "-q", "--build-arg", f"BASE={base}", "-t", tag,
-                     "-f", str(agent.root / rt.dockerfile), str(agent.root)],
-                    timeout=INSTALLED_BUILD_TIMEOUT_S, kind="image")
+        with build_lock(tag):   # concurrent trials wait instead of racing the same build
+            if _docker(["image", "inspect", tag], check=False).returncode != 0:
+                _docker(["tag", task_image_id, base])
+                _docker(["build", "-q", "--build-arg", f"BASE={base}", "-t", tag,
+                         "-f", str(agent.root / rt.dockerfile), str(agent.root)],
+                        timeout=INSTALLED_BUILD_TIMEOUT_S, kind="image")
         return _docker(["image", "inspect", "--format", "{{.Id}}", tag], kind="image").stdout.decode().strip()
 
     def run(self, spec: TrialSpec, chamber: Sandbox, rec: Recorder, deadline: float) -> AgentOutcome:
@@ -59,7 +59,7 @@ class InstalledRunner:
         stopped: str | None = None
         timed_out = False
         try:
-            r = chamber.exec(script, timeout=timeout, cwd=WORKSPACE, env=_public_env(rt),
+            r = chamber.exec(script, timeout=timeout, cwd=spec.task.workspace, env=_public_env(rt),
                              secret_env=_secret_env(spec.agent, rt), stdout_path=output_path)
             timed_out = r.timed_out
             rec.event("installed_agent_exit", {"returncode": r.returncode, "timed_out": r.timed_out,
@@ -200,6 +200,7 @@ def parse_claude_stream_json(output: str, rec: Recorder) -> AgentOutcome:
         cost_usd=safe_num(result.get("total_cost_usd"), float),
         n_commands=n_tools,
         message=text[:2000],
+        answer=text[:100000],
     )
 
 

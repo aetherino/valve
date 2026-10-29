@@ -1,0 +1,11 @@
+[environment]
+workdir = "/app"
+cpus = 1
+memory = "1g"
+
+[agent]
+timeout_sec = 600
+
+[verifier]
+mode = "chamber"      # the outcome is a running process, not a file
+timeout_sec = 60

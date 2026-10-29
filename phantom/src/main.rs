@@ -219,6 +219,7 @@ fn run(args: &[String]) -> i32 {
     let model = config.get("model").and_then(Value::as_str).unwrap_or("").to_string();
     let max_turns = config.get("step_limit").and_then(Value::as_u64).unwrap_or(50).to_string();
     let cmd_timeout = config.get("command_timeout_s").and_then(Value::as_u64).unwrap_or(600);
+    let workspace = start.get("workspace").and_then(Value::as_str).unwrap_or("/workspace").to_string();
 
     if let Err(e) = serve_shells(worker.clone(), cmd_timeout) {
         worker.request("finish", json!({"exit_status": "agent_error", "message": format!("socket: {e}")}));
@@ -233,7 +234,7 @@ fn run(args: &[String]) -> i32 {
         let out = fs::File::create(&output)?;
         let err = fs::File::create(format!("{output}.stderr"))?;
         let mut c = Command::new(&argv[0]).args(&argv[1..]).env("PHANTOM_SOCKET", SOCKET)
-            .env("SHELL", "/bin/bash").current_dir("/workspace")
+            .env("SHELL", "/bin/bash").current_dir(&workspace)
             .stdin(Stdio::piped()).stdout(out).stderr(err).spawn()?;
         if let Some(mut stdin) = c.stdin.take() { let _ = stdin.write_all(instruction.as_bytes()); }
         Ok(c)
@@ -303,8 +304,9 @@ fn outcome_from_stream_json(output: &str) -> Value {
         ("error_max_turns", _) => "step_limit",
         _ => "agent_error",
     };
-    let mut message = r.get("result").and_then(Value::as_str).unwrap_or(subtype).to_string();
-    message.truncate(2000);
+    let full = r.get("result").and_then(Value::as_str).unwrap_or(subtype).to_string();
+    let message: String = full.chars().take(2000).collect();
+    let answer: String = full.chars().take(100_000).collect();   // for graders that need the final answer
     json!({
         "exit_status": status,
         "steps": n(&r, "num_turns"),
@@ -312,6 +314,7 @@ fn outcome_from_stream_json(output: &str) -> Value {
         "output_tokens": n(&usage, "output_tokens"),
         "cost_usd": r.get("total_cost_usd").and_then(Value::as_f64).unwrap_or(0.0),
         "message": message,
+        "answer": answer,
     })
 }
 
@@ -345,6 +348,7 @@ mod tests {
         assert_eq!(o["exit_status"], "submitted");
         assert_eq!(o["input_tokens"], 3);
         assert_eq!(o["steps"], 3);
+        assert_eq!(o["answer"], "ok");
         assert_eq!(outcome_from_stream_json("garbage")["exit_status"], "agent_error");
     }
 }

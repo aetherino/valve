@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from vals_harness.benchmarks import BenchmarkAdapter
+from vals_harness.benchmarks import make_benchmark
 from vals_harness.chamber_api import AgentOutcome, ChamberApi
 from vals_harness.errors import InfraError
 from vals_harness.installed import InstalledRunner
@@ -27,7 +27,6 @@ from vals_harness.sandbox import SandboxProvider
 from vals_harness.specs import TrialSpec, folder_digest, missing_secrets
 from vals_harness.store import Claim, LostLease, Store
 
-WORKSPACE = "/workspace"
 
 
 class TrialRecorder:
@@ -88,15 +87,16 @@ class TrialRunner:
             # 1 PREPARE
             self._phase(claim, rec, "preparing")
             self._check_inputs(spec)
-            bench = BenchmarkAdapter(spec.benchmark, self.provider)
+            bench = make_benchmark(spec.benchmark, self.provider)
+            task, workspace = spec.task, spec.task.workspace
+            mode = bench.verify_mode(task)
             placement = spec.agent.placement
             launcher = self.launchers.get(placement) if placement in ("host", "sidecar") else None
             if placement in ("host", "sidecar") and launcher is None:
                 raise InfraError("adapter", f"placement {placement!r} is not available")
             # Images (task, tooling, agent) are resolved before any container starts,
             # so a slow build never holds a chamber open, and all of them get pinned.
-            pins = {"task_image": self.provider.ensure_image(spec.task.image),
-                    "tooling_image": bench.tooling_image()}
+            pins = bench.images(task)
             chamber_image = pins["task_image"]
             if placement == "installed":
                 # The chamber itself is task image + agent runtime (a prebuilt layer, never installed live).
@@ -106,25 +106,27 @@ class TrialRunner:
             elif agent_image := launcher.prepare(spec.agent):  # type: ignore[union-attr]
                 pins["agent_image"] = agent_image
             self._write_manifest(spec, pins, folder)
-            prepared = bench.prepare(spec.task, folder / "work", labels)
+            prepared = bench.prepare(task, folder / "work", labels)
 
-            # 2 CHAMBER + 3 AGENT + 4 COLLECT
+            # 2 CHAMBER + 3 AGENT (+ VERIFY in chamber mode) + 4 COLLECT
             self._phase(claim, rec, "running_agent")
             t_agent = time.monotonic()
             deadline = time.monotonic() + spec.limits.timeout_s
             # An installed agent calls its model from inside the chamber, so that chamber
             # needs egress (v2: model proxy only). Everything else stays offline.
             network = "egress" if placement == "installed" else spec.policy.network
-            # Phantom box and chamber share /workspace and /tmp (per-trial volumes).
-            volumes = phantom_volumes(claim.token, labels) if placement == "phantom" else None
+            # Phantom box and chamber share the workspace and /tmp (per-trial volumes).
+            volumes = phantom_volumes(claim.token, labels, workspace) if placement == "phantom" else None
+            grade = vr = None
             # Created from a pinned image id, so a tag can't move under a running trial.
             with self.provider.create(chamber_image, labels={**labels, "vals.role": "chamber"},
-                                      network=network, cpus=spec.limits.cpus,
-                                      memory=spec.limits.memory, volumes=volumes) as chamber:
-                chamber.put_dir(prepared.visible_dir, WORKSPACE)
+                                      network=network, cpus=spec.limits.cpus, memory=spec.limits.memory,
+                                      volumes=volumes, workdir=workspace) as chamber:
+                if any(prepared.visible_dir.iterdir()):
+                    chamber.put_dir(prepared.visible_dir, workspace)
                 env_check = self._check_env(chamber, spec.agent.expects, rec)
                 if spec.policy.expose_eval_files and any(prepared.eval_dir.iterdir()):
-                    chamber.put_dir(prepared.eval_dir, WORKSPACE)
+                    chamber.put_dir(prepared.eval_dir, workspace)
                 if placement == "installed":
                     outcome = self.installed.run(spec, chamber, rec, deadline)
                 else:
@@ -134,20 +136,28 @@ class TrialRunner:
                     else:
                         session = launcher.launch(spec.agent, folder / "agent_stderr.log", labels)  # type: ignore[union-attr]
                     api = ChamberApi(chamber, rec, trial_id=spec.trial_id,
-                                     command_timeout_s=spec.limits.command_timeout_s)
+                                     command_timeout_s=spec.limits.command_timeout_s, workspace=workspace)
                     outcome = api.serve(session, self._start_payload(spec, chamber), deadline=deadline)
-                self._collect(chamber, folder / "workspace.tar", rec)
-            timings["agent_s"] = time.monotonic() - t_agent
-            if outcome.exit_status == "model_error":
-                # The model provider failed before the agent did anything (ChamberApi and the
-                # installed parser only allow this status then): not the agent's failure.
-                raise InfraError("model_api", outcome.message or "model provider error")
+                timings["agent_s"] = time.monotonic() - t_agent
+                if outcome.exit_status == "model_error":
+                    # The model provider failed before the agent did anything (ChamberApi and the
+                    # installed parser only allow this status then): not the agent's failure.
+                    raise InfraError("model_api", outcome.message or "model provider error")
+                if mode == "chamber":
+                    # The outcome is the environment's state (a running service, files outside
+                    # the workspace), so the tests run here, before anything is stopped.
+                    self._phase(claim, rec, "verifying")
+                    t_verify = time.monotonic()
+                    grade, vr = bench.verify_in_chamber(task, chamber, prepared, spec.limits.verify_timeout_s,
+                                                        answer=outcome.answer)
+                self._collect(chamber, folder / "workspace.tar", rec, workspace)
 
-            # 5 VERIFY
-            self._phase(claim, rec, "verifying")
-            t_verify = time.monotonic()
-            grade, vr = bench.verify(spec.task, folder / "workspace.tar", prepared, folder / "work",
-                                     labels, timeout=spec.limits.verify_timeout_s)
+            # 5 VERIFY (fresh sandbox: tooling / task_image modes)
+            if grade is None:
+                self._phase(claim, rec, "verifying")
+                t_verify = time.monotonic()
+                grade, vr = bench.verify(task, folder / "workspace.tar", prepared, folder / "work", labels,
+                                         timeout=spec.limits.verify_timeout_s, images=pins, answer=outcome.answer)
             timings["verify_s"] = time.monotonic() - t_verify
             (folder / "verifier.log").write_text(vr.output if vr else "")
             result = {"status": "graded", "grade": {"passed": grade.passed, "score": grade.score,
@@ -213,7 +223,7 @@ class TrialRunner:
             raise InfraError("config", f"agent {spec.agent.name} needs {', '.join(missing)}, not set for the worker")
 
     @staticmethod
-    def _collect(chamber: Any, tar_path: Path, rec: TrialRecorder) -> None:
+    def _collect(chamber: Any, tar_path: Path, rec: TrialRecorder, workspace: str) -> None:
         """Stop everything in the chamber, then snapshot /workspace from the stopped container.
 
         Halting first means nothing the agent left running keeps writing during the copy.
@@ -223,7 +233,7 @@ class TrialRunner:
         """
         chamber.halt()
         try:
-            chamber.snapshot(WORKSPACE, tar_path)
+            chamber.snapshot(workspace, tar_path)
         except InfraError as e:
             if not chamber.exists():
                 raise
@@ -243,7 +253,7 @@ class TrialRunner:
         except Exception:
             uname = ""
         return {"instruction": spec.task.instruction, "config": spec.agent_config(),
-                "task": {"id": spec.task.id}, "workspace": WORKSPACE,
+                "task": {"id": spec.task.id}, "workspace": spec.task.workspace,
                 "deadline_unix": time.time() + spec.limits.timeout_s, "chamber": {"uname": uname}}
 
     @staticmethod

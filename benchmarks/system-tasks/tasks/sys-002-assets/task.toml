@@ -1,0 +1,9 @@
+[environment]
+workdir = "/app"
+
+[agent]
+timeout_sec = 600
+
+[verifier]
+mode = "task_image"   # a fresh container from this task's image + the agent's /app
+timeout_sec = 60

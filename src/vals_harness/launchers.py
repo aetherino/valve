@@ -22,7 +22,7 @@ from typing import Protocol
 
 from vals_harness.errors import InfraError
 from vals_harness.protocol import StdioTransport, Transport
-from vals_harness.sandbox.docker import HARDENING, _docker
+from vals_harness.sandbox.docker import build_lock, HARDENING, _docker
 from vals_harness.specs import AgentSpec
 
 SRC_DIR = Path(__file__).resolve().parents[1]  # .../src, so agents can import vals_agent_sdk
@@ -149,14 +149,15 @@ class DockerLauncher:
             return self._images[agent.name]
         recipe = self._recipe(agent)
         tag = self.tag_for(agent)
-        if _docker(["image", "inspect", tag], check=False).returncode != 0:
-            with tempfile.TemporaryDirectory(prefix="vals-agent-build-") as ctx:
-                # Build context = the agent folder + the SDK, nothing else from the repo.
-                shutil.copytree(agent.root, Path(ctx) / "agent",
-                                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".env*"))
-                shutil.copytree(SDK_DIR, Path(ctx) / "vals_agent_sdk", ignore=shutil.ignore_patterns("__pycache__"))
-                (Path(ctx) / "Dockerfile").write_bytes(recipe)
-                _docker(["build", "-q", "-t", tag, ctx], timeout=AGENT_BUILD_TIMEOUT_S, kind="image")
+        with build_lock(tag):   # concurrent trials wait instead of racing the same build
+            if _docker(["image", "inspect", tag], check=False).returncode != 0:
+                with tempfile.TemporaryDirectory(prefix="vals-agent-build-") as ctx:
+                    # Build context = the agent folder + the SDK, nothing else from the repo.
+                    shutil.copytree(agent.root, Path(ctx) / "agent",
+                                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".env*"))
+                    shutil.copytree(SDK_DIR, Path(ctx) / "vals_agent_sdk", ignore=shutil.ignore_patterns("__pycache__"))
+                    (Path(ctx) / "Dockerfile").write_bytes(recipe)
+                    _docker(["build", "-q", "-t", tag, ctx], timeout=AGENT_BUILD_TIMEOUT_S, kind="image")
         self._images[agent.name] = tag
         return tag
 

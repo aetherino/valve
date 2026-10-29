@@ -16,8 +16,9 @@ from typing import Any, Callable
 
 from vals_harness.installed import InstalledRunner
 from vals_harness.launchers import DockerLauncher
+from vals_harness.phantom import PhantomLauncher
 from vals_harness.sandbox.docker import DockerSandboxProvider, image_ids, remove_images, vals_images
-from vals_harness.specs import (AgentSpec, BenchmarkSpec, RunSpec, TrialSpec, load_agent, load_benchmark,
+from vals_harness.specs import (Task, load_tasks, AgentSpec, BenchmarkSpec, RunSpec, TrialSpec, load_agent, load_benchmark,
                                 missing_secrets, resolve_trials, trial_budget_s)
 from vals_harness.store import ACTIVE, Claim, Store
 
@@ -281,14 +282,34 @@ def _tags_for(agents: list[AgentSpec], benches: list[BenchmarkSpec], task_image_
     for agent in agents:
         if agent.placement == "sidecar" and agent.root.is_dir():
             keep.add(DockerLauncher.tag_for(agent))
-        elif agent.placement == "installed" and agent.root.is_dir():
-            # One layer (and one `vals/base:` tag) per task image.
+        elif agent.placement in ("installed", "phantom") and agent.root.is_dir():
+            # One layer (and one `vals/base:` tag) per task image; phantom adds one more on top.
             for image_id in task_image_ids:
-                keep |= {InstalledRunner.tag_for(agent, image_id), InstalledRunner.base_tag(image_id)}
+                installed = InstalledRunner.tag_for(agent, image_id)
+                keep |= {installed, InstalledRunner.base_tag(image_id)}
+                if agent.placement == "phantom" and (layer_id := image_ids([installed]).get(installed)):
+                    keep |= {PhantomLauncher.tag_for(agent, layer_id), InstalledRunner.base_tag(layer_id)}
     for bench in benches:
         if bench.tooling_dockerfile and (bench.root / bench.tooling_dockerfile).is_file():
             keep.add(DockerSandboxProvider.tooling_tag(bench.root / bench.tooling_dockerfile))
+        if bench.root.is_dir():
+            keep |= {t for t in (task_image_ref(bench, task) for task in _safe_tasks(bench)) if t.startswith("vals/")}
     return keep
+
+
+def task_image_ref(bench: BenchmarkSpec, task: Task) -> str:
+    """The image name a task runs from: its pulled image, or the tag its build gets."""
+    if task.image:
+        return task.image
+    name = f"task-{bench.name}-{task.id}" if bench.format == "task_dirs" else f"task-{bench.name}"
+    return DockerSandboxProvider.tooling_tag(bench.root / str(task.build), name)
+
+
+def _safe_tasks(bench: BenchmarkSpec) -> list[Task]:
+    try:
+        return load_tasks(bench)
+    except Exception:
+        return []
 
 
 def current_image_tags(paths: Paths, task_image_ids: set[str] | None = None) -> set[str]:
@@ -309,7 +330,7 @@ def prune(paths: Paths, *, dry_run: bool = False) -> dict[str, list[str] | int]:
     store = Store(paths.db)
     specs = [(row["status"], TrialSpec.model_validate_json(row["spec_json"]))
              for row in store.db.execute("SELECT status, spec_json FROM trials")]
-    task_ids = set(image_ids(sorted({s.task.image for _, s in specs})).values())
+    task_ids = set(image_ids(sorted({task_image_ref(s.benchmark, s.task) for _, s in specs})).values())
     pending = [s for status, s in specs if status == "queued" or status in ACTIVE]
     keep = current_image_tags(paths, task_ids) | _tags_for([s.agent for s in pending],
                                                            [s.benchmark for s in pending], task_ids)

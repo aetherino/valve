@@ -95,10 +95,16 @@ def test_trial_wall_clock_kills_the_trial_and_its_containers(root, tmp_path, mon
 
     from vals_harness.specs import Policy
 
-    monkeypatch.setenv("VALS_HOME", str(tmp_path))
+    # An agent that never finishes, so the trial clock (not the agent's own) always fires first.
+    sleeper = tmp_path / "sleeper"
+    sleeper.mkdir()
+    (sleeper / "agent.py").write_text("import time\nfrom vals_agent_sdk.client import AgentClient\n"
+                                      "AgentClient('sleeper', '1')\ntime.sleep(600)\n")
+    (sleeper / "agent.yaml").write_text("name: sleeper\nplacement: sidecar\ncommand: [python, agent.py]\n")
+    monkeypatch.setenv("VALS_HOME", str(tmp_path / "home"))
     paths = service.Paths.from_root(root)
-    run_id = service.submit(paths, RunSpec(agent="agents/oracle", benchmark="python-tasks", task_ids=["py-001"],
-                                           limits={"trial_timeout_s": 2}, policy=Policy(infra_retries=0)))
+    run_id = service.submit(paths, RunSpec(agent=str(sleeper), benchmark="python-tasks", task_ids=["py-001"],
+                                           limits={"trial_timeout_s": 8}, policy=Policy(infra_retries=0)))
     service.work(paths, run_id=run_id)
     (t,) = summarize(Store(paths.db), run_id)["trials"]
     assert t["status"] == "infra_error" and t["error"]["kind"] == "timeout_harness"

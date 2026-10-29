@@ -67,46 +67,93 @@ LIMIT_KEYS = set(Limits.model_fields)
 
 
 class BenchmarkFields(Frozen):
-    """Maps the benchmark's own dataset column names onto ours."""
+    """Maps the benchmark's own dataset column names onto ours (format: scripts)."""
 
     id: str
     instruction: str
     image: str
 
 
+VerifyMode = Literal["tooling", "task_image", "chamber"]
+
+
 class BenchmarkSpec(Frozen):
+    """How to read a benchmark's tasks and grade them. Three formats share one shape:
+
+    scripts    a dataset file + the benchmark's own setup/grading scripts, run in a
+               tooling image (the starter's bash-operations / python-tasks)
+    task_dirs  one folder per task, Harbor / Terminal-Bench style: instruction.md,
+               task.toml, environment/Dockerfile (+ assets), tests/test.sh -> reward file
+    python     `adapter: file.py:Class` in the benchmark folder implements the Benchmark
+               protocol (benchmarks.py) for anything else (HF datasets, SWE-bench, ...)
+    """
+
     name: str
     version: str = "1"
+    format: Literal["scripts", "task_dirs", "python"] = "scripts"
+    # --- scripts
     dataset: str = "dataset.json"
-    fields: BenchmarkFields
+    fields: BenchmarkFields | None = None
     tooling_image: str | None = None        # an existing image, e.g. python:3.11-slim
     tooling_dockerfile: str | None = None   # or a Dockerfile in the benchmark folder
-    prepare: list[str]                      # placeholders: {task_id}, {out}
+    prepare: list[str] = []                 # placeholders: {task_id}, {out}
     eval_paths: list[str] = []              # files moved from visible/ to eval/
+    verify: list[str] = []                  # placeholders: {task_id}, {workspace}
+    result_parser: Literal["json_stdout", "exit_code"] | None = None
+    # --- task_dirs
+    tasks_dir: str = "tasks"
+    # --- python
+    adapter: str | None = None              # "adapter.py:MyBenchmark"
+    # --- all formats
     # Which agent-written files are carried into the verifier (globs, relative to the
     # workspace). "**" = the whole workspace. Anything narrower starts the verifier from
     # the pristine prepared workspace and copies in only these files, so an agent can't
     # plant files (pytest.py, conftest.py, ...) that hijack a grader which runs code.
     submission_paths: list[str] = ["**"]
-    verify: list[str]                       # placeholders: {task_id}, {workspace}
-    result_parser: Literal["json_stdout", "exit_code"]
     # Regexes that must all match the grader's raw output for a "pass" to count.
     # Guards graders that trust an exit code the submission can fake.
     pass_requires: list[str] = []
+    pass_threshold: float = 1.0             # reward files: score >= threshold passes
+    # Grader policy for fresh verifiers (tooling / task_image): LLM-judge graders need
+    # network and a key; everything else stays offline with no secrets.
+    verify_network: Literal["none", "egress"] = "none"
+    verify_secrets: list[str] = []
     defaults: dict[str, Any] = {}
     root: Path                              # set by the loader: the benchmark folder
 
     @model_validator(mode="after")
-    def _one_tooling_source(self) -> BenchmarkSpec:
-        if (self.tooling_image is None) == (self.tooling_dockerfile is None):
-            raise ValueError("set exactly one of tooling_image / tooling_dockerfile")
+    def _format_fields(self) -> BenchmarkSpec:
+        if self.format == "scripts":
+            if (self.tooling_image is None) == (self.tooling_dockerfile is None):
+                raise ValueError("scripts: set exactly one of tooling_image / tooling_dockerfile")
+            missing = [k for k in ("fields", "result_parser") if getattr(self, k) is None]
+            missing += [k for k in ("prepare", "verify") if not getattr(self, k)]
+            if missing:
+                raise ValueError(f"scripts format needs {missing}")
+        if self.format == "python" and not self.adapter:
+            raise ValueError("python format needs `adapter: file.py:Class`")
         return self
 
 
 class Task(Frozen):
+    """One problem, normalized from any benchmark format."""
+
     id: str
     instruction: str
-    image: str
+    image: str | None = None                # an existing image ...
+    build: str | None = None                # ... or a Dockerfile (relative to the benchmark folder)
+    workspace: str = "/workspace"           # where the agent works (SWE-bench: /testbed, Harbor: /app)
+    verify_mode: VerifyMode | None = None   # None = the format's default
+    limits: dict[str, Any] = {}             # per-task overrides (e.g. from task.toml)
+    meta: dict[str, Any] = {}               # format-specific extras, opaque to the harness
+
+    @model_validator(mode="after")
+    def _one_image_source(self) -> Task:
+        if (self.image is None) == (self.build is None):
+            raise ValueError(f"task {self.id}: set exactly one of image / build")
+        if not self.workspace.startswith("/") or self.workspace.rstrip("/") in ("", "/tmp"):
+            raise ValueError(f"task {self.id}: workspace must be an absolute path other than / and /tmp")
+        return self
 
 
 def load_benchmark(ref: str, root: Path) -> BenchmarkSpec:
@@ -117,9 +164,14 @@ def load_benchmark(ref: str, root: Path) -> BenchmarkSpec:
 
 
 def load_tasks(bench: BenchmarkSpec) -> list[Task]:
-    rows = json.loads((bench.root / bench.dataset).read_text())
-    f = bench.fields
-    return [Task(id=r[f.id], instruction=r[f.instruction], image=r[f.image]) for r in rows]
+    """Tasks for any format. Cheap (no Docker): called at submit time."""
+    if bench.format == "scripts":
+        rows = json.loads((bench.root / bench.dataset).read_text())
+        f = bench.fields
+        assert f is not None
+        return [Task(id=r[f.id], instruction=r[f.instruction], image=r[f.image]) for r in rows]
+    from vals_harness.benchmarks import make_benchmark   # adapters live with the grading code
+    return make_benchmark(bench, provider=None).tasks()
 
 
 # ------------------------------------------------------------------ agent
@@ -255,7 +307,7 @@ def resolve_trials(run: RunSpec, run_id: str, root: Path, harness_version: str) 
     def limit_part(d: dict[str, Any]) -> dict[str, Any]:
         return {k: v for k, v in d.items() if k in LIMIT_KEYS}
 
-    limits = Limits(**{**limit_part(bench.defaults), **limit_part(agent.defaults), **run.limits})
+    base_limits = {**limit_part(bench.defaults), **limit_part(agent.defaults)}
     model = run.model or agent.defaults.get("model")
     digests = {"benchmark": folder_digest(bench.root), "agent": folder_digest(agent.root)}
     return [
@@ -267,7 +319,8 @@ def resolve_trials(run: RunSpec, run_id: str, root: Path, harness_version: str) 
             benchmark=bench,
             agent=agent,
             model=model,
-            limits=limits,
+            # precedence: run overrides > task (e.g. task.toml) > agent > benchmark > harness
+            limits=Limits(**{**base_limits, **limit_part(task.limits), **run.limits}),
             policy=run.policy,
             harness_version=harness_version,
             inputs_digest=digests,

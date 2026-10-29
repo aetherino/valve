@@ -37,6 +37,8 @@ Status: draft for discussion. **(proposed)** marks decisions still open to chang
 | Installed runtime | Image layer FROM pinned task image | `npm install` inside a live chamber | Cached, reproducible (pinned id), no slow install inside a running trial |
 | Claude Code without polluting the chamber | Phantom box: mirror (same base + shared /workspace,/tmp) + phantom shell | ACP client; MCP tool swap; FUSE mirror; shared namespaces | Stock Claude Code, chamber offline and secret-free. ACP's delegation coverage is unverified; an MCP swap measures a different agent; FUSE/namespaces need CAP_SYS_ADMIN in the box |
 | Agent assumes bash, task image has none | Declare `expects`, probe, flag in results | Silently add bash to the chamber; rewrite the agent's prompt | The task image is the experiment; Vals measures and reports, it doesn't fix contestants or the course |
+| Generality across benchmarks | One protocol + 3 formats (scripts, Harbor-style task folders, Python hook) + per-task verify modes | One YAML adapter for the starter's shape | Real benchmarks grade system state, need per-task images/assets/workspaces, and sometimes grade the answer, not files |
+| Grading system state | `chamber` verify mode, with wiped tests/reward dir and recorded surviving processes | Fresh-container grading only | A running service can't be graded from a file snapshot; the integrity cost is made visible |
 | Benchmark scripts | Run in a tooling container | Run on the host | `prepare.py` installs packages; host stays clean |
 | Shell choice (`sh` vs `bash`) | The `Sandbox` | Each agent adapter | It's a property of the image; solved once for all agents |
 | Job unit | Trial | Run | Parallelism, per-trial retry, partial results early |
@@ -352,6 +354,32 @@ verify: ["python", "evaluate.py", "--workspace-dir", "/workspace", "--task", "{t
 result_parser: json_stdout
 ```
 
+### 6.1b Any benchmark: formats, verify modes, workspace, answers
+
+One `Benchmark` protocol (`benchmarks.py`): `tasks()`, `images(task)`, `prepare()`, `verify_mode(task)`, `verify()` (fresh sandbox) and `verify_in_chamber()`. The trial runner never knows which format it's running.
+
+| `format` | What it covers | Grounding |
+|---|---|---|
+| `scripts` | a dataset file + the benchmark's own setup/grading scripts in a tooling image | the starter's bash-operations, python-tasks |
+| `task_dirs` | one folder per task: `instruction.md`, `task.toml` (timeouts, resources, workdir, verify mode), `environment/Dockerfile` + assets, `tests/test.sh` → `/logs/verifier/reward.txt` or `reward.json`, `solution/solve.sh` | Harbor / Terminal-Bench task format |
+| `python` | `adapter: file.py:Class` in the benchmark folder implements the protocol | escape hatch: HF datasets, SWE-bench, Q&A, LLM-judged tasks |
+
+**Where grading runs** (`verify_mode`, per task):
+
+| Mode | Container | For | Integrity |
+|---|---|---|---|
+| `tooling` | fresh benchmark tooling image + submission | graders that are scripts (starter benchmarks) | strongest: agent never touched it |
+| `task_image` | fresh container from the task's own image + submission | graders needing the task's dependencies (SWE-bench style) | strong; deletions mirrored for `**` submissions |
+| `chamber` | the agent's chamber, after it stops, before teardown | outcomes that are *system state*: a running service, files outside the workspace (Terminal-Bench style) | weaker: the agent shaped this environment. Tests and the reward dir are wiped and copied in only at verify time (a pre-written reward doesn't count); processes still alive during the tests are recorded with the grade (`processes_during_tests`) because a lingering process could interfere and can't be killed without breaking service tasks |
+
+- **Per-task images and assets**: a task brings an image or a Dockerfile; builds are content-hashed, pinned by id, and serialized per tag across processes (`build_lock`, after two concurrent builds of one image collided in Docker's legacy builder).
+- **Per-task workspace** (`Task.workspace`: `/workspace`, `/app`, `/testbed`, ...): used for the chamber's workdir, the Chamber API's default cwd, snapshots, phantom volumes, and grading.
+- **Per-task limits** from `task.toml` (precedence: run > task > agent > benchmark > harness).
+- **The agent's final answer reaches the grader**: agents may send `answer` in `finish` (mini: its submission; Claude Code: its final message). Fresh and chamber graders find it at `/logs/agent/answer.txt`; Python adapters receive it directly. For Q&A, proofs, reports.
+- **Grader policy** for LLM judges: `verify_network: egress` and `verify_secrets: [...]` on the BenchmarkSpec (fresh modes only; secrets via `docker exec -e NAME`).
+- **Proof:** `benchmarks/system-tasks` (task_dirs): a running HTTP service (chamber), an asset CSV baked into the image (task_image), a command installed on PATH in alpine (chamber). oracle 3/3, noop 0/3, cheater 0/3; mini-swe-agent 3/3 and Claude Code (phantom) 3/3 live. A fixture Python adapter grades a Q&A task purely on the agent's answer.
+- **Out of scope, with the seam named**: multi-container tasks (`docker-compose.yaml`; a SandboxProvider that creates a set of containers on one network), simulated users (tau-bench; a `user` method in the protocol), GUI/browser tasks (a VNC sandbox type), Harbor multi-step tasks (`steps/step-N/`).
+
 ### 6.2 AgentSpec — `agents/<name>/agent.yaml`
 
 ```yaml
@@ -574,7 +602,8 @@ vals-harness/
 ├── src/vals_agent_sdk/     client.py (agent side of vals-agent/1, stdlib only)
 ├── phantom/                Rust: phantom runner + phantom shell
 ├── agents/                 mini-swe-agent/ · claude-code/ · claude-code-phantom/ · oracle/ · noop/ · cheater/ · vandal/ · saboteur/
-├── benchmarks/             bash-operations/ · python-tasks/   (starter files untouched + harness.yaml; python-tasks
+├── benchmarks/             bash-operations/ · python-tasks/ (starter, untouched + harness.yaml) · system-tasks/ (task folders)
+│                           (python-tasks
 │                           carries its tooling.Dockerfile)
 ├── tests/
 └── README.md · DESIGN.md · architecture.excalidraw

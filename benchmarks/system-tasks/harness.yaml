@@ -1,0 +1,7 @@
+# A third benchmark in a different shape: Harbor / Terminal-Bench style task folders.
+# Each task brings its own Dockerfile (+ assets), timeouts and test script, and two of
+# them are judged on system state outside any workspace, so they grade in the chamber.
+name: system-tasks
+version: "1"
+format: task_dirs
+tasks_dir: tasks

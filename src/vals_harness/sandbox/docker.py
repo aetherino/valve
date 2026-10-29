@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import io
+import tempfile
 import json
 import os
 import tarfile
@@ -170,7 +173,7 @@ class DockerSandbox:
 
     # -------------------------------------------------------------- commands
 
-    def exec(self, cmd: str, *, timeout: int, cwd: str = "/workspace",
+    def exec(self, cmd: str, *, timeout: int, cwd: str | None = None,
              env: dict[str, str] | None = None, stdin: bytes | None = None,
              secret_env: dict[str, str] | None = None, stdout_path: Path | None = None) -> ExecResult:
         """`secret_env` values travel through the docker CLI's own environment
@@ -178,7 +181,8 @@ class DockerSandbox:
         `stdout_path`, stdout streams to that host file (capped at MAX_STREAM_BYTES)."""
         if self.stopped_inside:
             raise ChamberStopped(self.stopped_inside)
-        args = ["exec"] + (["-i"] if stdin is not None else []) + ["-w", cwd]
+        # cwd None = the container's working directory (the task workspace, set at create)
+        args = ["exec"] + (["-i"] if stdin is not None else []) + (["-w", cwd] if cwd else [])
         for k, v in (env or {}).items():
             args += ["-e", f"{k}={v}"]
         for k in secret_env or {}:
@@ -298,10 +302,24 @@ class DockerSandbox:
         self.stop()
 
 
+@contextlib.contextmanager
+def build_lock(tag: str):
+    """Exclusive lock per image tag across processes on this machine (flock)."""
+    lock_dir = Path(tempfile.gettempdir()) / "vals-build-locks"
+    lock_dir.mkdir(exist_ok=True)
+    with open(lock_dir / (hashlib.sha256(tag.encode()).hexdigest()[:16] + ".lock"), "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
 class DockerSandboxProvider:
-    def ensure_image(self, image: str | None = None, *, dockerfile: Path | None = None) -> str:
+    def ensure_image(self, image: str | None = None, *, dockerfile: Path | None = None,
+                     name: str | None = None) -> str:
         if dockerfile is not None:
-            image = self._build(dockerfile)
+            image = self._build(dockerfile, name)
         assert image is not None
         found = _docker(["image", "inspect", "--format", "{{.Id}}", image], check=False)
         if found.returncode != 0:
@@ -310,26 +328,33 @@ class DockerSandboxProvider:
         return found.stdout.decode().strip()
 
     @staticmethod
-    def tooling_tag(dockerfile: Path) -> str:
-        """Tag = content hash of the Dockerfile's folder (the build context)."""
+    def tooling_tag(dockerfile: Path, name: str | None = None) -> str:
+        """Tag = content hash of the Dockerfile + its folder (the build context)."""
         context = dockerfile.parent
         h = hashlib.sha256()
+        h.update(dockerfile.name.encode())
         for f in sorted(p for p in context.rglob("*") if p.is_file()):
             h.update(str(f.relative_to(context)).encode())
             h.update(f.read_bytes())
-        return f"vals/{context.name}-tooling:{h.hexdigest()[:12]}"
+        return f"vals/{name or context.name + '-tooling'}:{h.hexdigest()[:12]}"
 
-    def _build(self, dockerfile: Path) -> str:
-        """Build once per content hash of the build context."""
+    def _build(self, dockerfile: Path, name: str | None = None) -> str:
+        """Build once per content hash of the build context. Concurrent trials needing the
+        same image wait on a per-tag lock instead of racing two builds (Docker's legacy
+        builder fails intermittently when they collide)."""
         context = dockerfile.parent
-        tag = self.tooling_tag(dockerfile)
-        if _docker(["image", "inspect", tag], check=False).returncode != 0:
-            _docker(["build", "-q", "-t", tag, "-f", str(dockerfile), str(context)],
-                    timeout=TOOLING_BUILD_TIMEOUT_S, kind="image")
+        tag = self.tooling_tag(dockerfile, name)
+        if _docker(["image", "inspect", tag], check=False).returncode == 0:
+            return tag
+        with build_lock(tag):
+            if _docker(["image", "inspect", tag], check=False).returncode != 0:
+                _docker(["build", "-q", "-t", tag, "-f", str(dockerfile), str(context)],
+                        timeout=TOOLING_BUILD_TIMEOUT_S, kind="image")
         return tag
 
     def create(self, image: str, *, labels: dict[str, str], network: str = "none",
-               cpus: float = 1.0, memory: str = "1g", volumes: dict[str, str] | None = None) -> DockerSandbox:
+               cpus: float = 1.0, memory: str = "1g", volumes: dict[str, str] | None = None,
+               workdir: str = "/workspace") -> DockerSandbox:
         args = ["run", "-d", "--label", "vals.managed=1"]
         for k, v in labels.items():
             args += ["--label", f"{k}={v}"]
@@ -339,7 +364,7 @@ class DockerSandboxProvider:
             *HARDENING,
             "--network", "none" if network == "none" else "bridge",
             "--cpus", str(cpus), "--memory", memory,
-            "-w", "/workspace",
+            "-w", workdir,
             # Override any image entrypoint: we only need the container to stay alive.
             "--entrypoint", "tail", image, "-f", "/dev/null",
         ]

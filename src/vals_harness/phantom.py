@@ -29,7 +29,7 @@ from vals_harness.errors import InfraError
 from vals_harness.installed import InstalledRunner, _public_env, _secret_env
 from vals_harness.launchers import ProcessSession, _start
 from vals_harness.protocol import StdioTransport
-from vals_harness.sandbox.docker import HARDENING, _docker
+from vals_harness.sandbox.docker import build_lock, HARDENING, _docker
 from vals_harness.specs import AgentSpec
 
 CRATE_DIR = Path(__file__).resolve().parents[2] / "phantom"
@@ -57,13 +57,15 @@ RUN set -e; mkdir -p /usr/lib/phantom /var/lib/phantom /run/phantom; \\
 """
 
 
-def volume_names(claim_token: str) -> dict[str, str]:
+def volume_names(claim_token: str, workspace: str = "/workspace") -> dict[str, str]:
     t = claim_token[:16]
-    return {f"vals-ws-{t}": "/workspace", f"vals-tmp-{t}": "/tmp"}
+    return {f"vals-ws-{t}": workspace, f"vals-tmp-{t}": "/tmp"}
 
 
-def create_volumes(claim_token: str, labels: dict[str, str]) -> dict[str, str]:
-    vols = volume_names(claim_token)
+def create_volumes(claim_token: str, labels: dict[str, str], workspace: str = "/workspace") -> dict[str, str]:
+    """Named volumes start empty and Docker fills them from the image on first mount, so
+    a task image's own workspace contents (assets) show up in both containers."""
+    vols = volume_names(claim_token, workspace)
     for name in vols:
         args = ["volume", "create", "--label", "vals.managed=1"]
         for k, v in labels.items():
@@ -88,21 +90,27 @@ class PhantomLauncher:
         if key in self._ids:
             return self._ids[key]
         base_id = self.installed.prepare(agent, task_image_id)
-        h = hashlib.sha256(PHANTOM_LAYER.encode() + base_id.encode())
-        for f in sorted(p for p in CRATE_DIR.rglob("*") if p.is_file() and "target" not in p.parts):
-            h.update(str(f.relative_to(CRATE_DIR)).encode() + b"\0" + f.read_bytes())
-        tag = f"vals/phantom-{agent.name}:{h.hexdigest()[:12]}"
-        if _docker(["image", "inspect", tag], check=False).returncode != 0:
-            base_tag = f"vals/base:{base_id.removeprefix('sha256:')[:16]}"
-            _docker(["tag", base_id, base_tag])
-            with tempfile.TemporaryDirectory(prefix="vals-phantom-build-") as ctx:
-                shutil.copytree(CRATE_DIR, Path(ctx) / "phantom", ignore=shutil.ignore_patterns("target"))
-                (Path(ctx) / "Dockerfile").write_text(PHANTOM_LAYER)
-                _docker(["build", "-q", "--build-arg", f"BASE={base_tag}", "-t", tag, ctx],
-                        timeout=1800, kind="image")
+        tag = self.tag_for(agent, base_id)
+        with build_lock(tag):   # concurrent trials wait instead of racing the same build
+            if _docker(["image", "inspect", tag], check=False).returncode != 0:
+                base_tag = f"vals/base:{base_id.removeprefix('sha256:')[:16]}"
+                _docker(["tag", base_id, base_tag])
+                with tempfile.TemporaryDirectory(prefix="vals-phantom-build-") as ctx:
+                    shutil.copytree(CRATE_DIR, Path(ctx) / "phantom", ignore=shutil.ignore_patterns("target"))
+                    (Path(ctx) / "Dockerfile").write_text(PHANTOM_LAYER)
+                    _docker(["build", "-q", "--build-arg", f"BASE={base_tag}", "-t", tag, ctx],
+                            timeout=1800, kind="image")
         image_id = _docker(["image", "inspect", "--format", "{{.Id}}", tag]).stdout.decode().strip()
         self._ids[key] = image_id
         return image_id
+
+    @staticmethod
+    def tag_for(agent: AgentSpec, base_id: str) -> str:
+        """Tag = hash of the phantom layer recipe + the Rust crate + the installed base image id."""
+        h = hashlib.sha256(PHANTOM_LAYER.encode() + base_id.encode())
+        for f in sorted(p for p in CRATE_DIR.rglob("*") if p.is_file() and "target" not in p.parts):
+            h.update(str(f.relative_to(CRATE_DIR)).encode() + b"\0" + f.read_bytes())
+        return f"vals/phantom-{agent.name}:{h.hexdigest()[:12]}"
 
     def launch(self, agent: AgentSpec, image_id: str, stderr_path: Path, labels: dict[str, str],
                volumes: dict[str, str]) -> ProcessSession:
@@ -122,7 +130,8 @@ class PhantomLauncher:
         secrets = _secret_env(agent, rt)
         for k in secrets:
             argv += ["-e", k]            # value comes from the docker CLI's environment, never argv
-        argv += ["-w", "/workspace", image_id, "phantom", "run", "--output", OUTPUT, "--", *shlex.split(rt.run)]
+        workspace = next((p for p in volumes.values() if p != "/tmp"), "/workspace")
+        argv += ["-w", workspace, image_id, "phantom", "run", "--output", OUTPUT, "--", *shlex.split(rt.run)]
         proc = _start(argv, cwd=None, env={**os.environ, **secrets}, stderr_path=stderr_path, name=agent.name)
         assert proc.stdin and proc.stdout
         return ProcessSession(proc, StdioTransport(proc.stdout, proc.stdin), container=name)

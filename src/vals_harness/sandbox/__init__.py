@@ -34,7 +34,7 @@ class Sandbox(Protocol):
     def exists(self) -> bool:
         """Does the sandbox still exist (running or stopped)? A stopped one can still be read."""
         ...
-    def exec(self, cmd: str, *, timeout: int, cwd: str = "/workspace",
+    def exec(self, cmd: str, *, timeout: int, cwd: str | None = None,
              env: dict[str, str] | None = None, stdin: bytes | None = None,
              secret_env: dict[str, str] | None = None, stdout_path: Path | None = None) -> ExecResult:
         """Raises ChamberStopped if the sandbox stopped from the inside, InfraError if
@@ -52,12 +52,14 @@ class Sandbox(Protocol):
 
 
 class SandboxProvider(Protocol):
-    def ensure_image(self, image: str | None = None, *, dockerfile: Path | None = None) -> str:
+    def ensure_image(self, image: str | None = None, *, dockerfile: Path | None = None,
+                     name: str | None = None) -> str:
         """Make the image available locally; return its immutable id (for the manifest)."""
         ...
 
     def create(self, image: str, *, labels: dict[str, str], network: str = "none",
-               cpus: float = 1.0, memory: str = "1g") -> Sandbox: ...
+               cpus: float = 1.0, memory: str = "1g", volumes: dict[str, str] | None = None,
+               workdir: str = "/workspace") -> Sandbox: ...
 
     def reap(self, labels: dict[str, str]) -> int:
         """Remove sandboxes matching all labels; return how many. Never raises."""

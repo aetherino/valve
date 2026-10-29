@@ -107,11 +107,12 @@ def main() -> None:
         "cost_limit": float(cfg.get("cost_limit_usd", 1.0)),
     })
 
-    exit_status, message = "agent_error", ""
+    exit_status, message, answer = "agent_error", "", ""
     try:
         info = agent.run(client.instruction)
         exit_status = EXIT_MAP.get(info.get("exit_status", ""), "agent_error")
         message = info.get("exit_status", "")
+        answer = info.get("submission", "") or ""   # text after the submit marker
     except PROVIDER_ERRORS as e:
         # The provider failed (bad key, rate limit, overload, unknown model). The harness
         # treats this as its own failure (retried) only if no command reached the chamber.
@@ -123,7 +124,7 @@ def main() -> None:
 
     usage = _usage(agent.messages)
     client.finish(exit_status, steps=agent.n_calls, cost_usd=round(agent.cost, 6),
-                  message=message[:2000], **usage)
+                  message=message[:2000], answer=answer[:100_000], **usage)
 
 
 def _usage(messages: list[dict]) -> dict[str, int]:

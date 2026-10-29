@@ -26,7 +26,6 @@ HELLO_TIMEOUT_S = 30
 CANCEL_GRACE_S = 10
 EXIT_GRACE_S = 10
 WATCHDOG_SLACK_S = 5   # past deadline + grace, the agent process is killed unconditionally
-WORKSPACE = "/workspace"
 # `docker run` itself failed before the agent said hello (125: daemon error / name
 # conflict, 126: cannot invoke, 127: not found). Before hello the agent hasn't seen the
 # task, so treating these as harness failures can't be used to dodge a hard task.
@@ -58,9 +57,12 @@ class AgentOutcome:
     n_commands: int = 0         # counted by the harness, not reported by the agent
     n_not_found: int = 0        # commands that exited 127 ("command not found"): an env-mismatch signal
     message: str = ""
+    answer: str = ""            # the agent's final answer, for graders that need it (Q&A, proofs)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        d["answer"] = d["answer"][:2000]   # full answer goes to the grader, a preview to results
+        return d
 
 
 class Recorder(Protocol):
@@ -73,7 +75,9 @@ class Recorder(Protocol):
 
 
 class ChamberApi:
-    def __init__(self, sandbox: Sandbox, recorder: Recorder, *, trial_id: str, command_timeout_s: int):
+    def __init__(self, sandbox: Sandbox, recorder: Recorder, *, trial_id: str, command_timeout_s: int,
+                 workspace: str = "/workspace"):
+        self.workspace = workspace
         self.sandbox = sandbox
         self.rec = recorder
         self.trial_id = trial_id
@@ -238,14 +242,13 @@ class ChamberApi:
             t.send(result(id_, value))
         return None
 
-    @staticmethod
-    def _path(p: Any) -> str:
+    def _path(self, p: Any) -> str:
         if not isinstance(p, str) or not p:
             raise ValueError("path must be a non-empty string")
-        return p if p.startswith("/") else f"{WORKSPACE}/{p}"
+        return p if p.startswith("/") else f"{self.workspace}/{p}"
 
     def _exec(self, p: dict[str, Any]) -> dict[str, Any]:
-        cmd, env, stdin, cwd = p["cmd"], p.get("env"), p.get("stdin"), p.get("cwd") or WORKSPACE
+        cmd, env, stdin, cwd = p["cmd"], p.get("env"), p.get("stdin"), p.get("cwd") or self.workspace
         if not isinstance(cmd, str):
             raise TypeError("cmd must be a string")
         if env is not None and not (isinstance(env, dict) and all(isinstance(k, str) and isinstance(v, str)
@@ -294,4 +297,5 @@ class ChamberApi:
             output_tokens=safe_num(p.get("output_tokens"), int),
             cost_usd=safe_num(p.get("cost_usd"), float),
             message=str(p.get("message") or "")[:2000],
+            answer=str(p.get("answer") or "")[:100000],
         )
