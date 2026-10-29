@@ -1,16 +1,4 @@
 """Installed agents: an off-the-shelf CLI (e.g. Claude Code) runs inside the chamber (DESIGN.md §5).
-
-This is the Harbor / Inspect SWE pattern, used because such CLIs' tools act on
-the machine they run on. The cost is that the chamber is no longer the bare task
-image, so:
-  - the runtime is a separate image layer built FROM the pinned task image
-    (cached by content hash, pinned by id in the manifest), never installed live;
-  - the chamber needs egress for model calls (v2: model proxy only);
-  - secrets reach the CLI's environment via `docker exec -e NAME`, never argv.
-The CLI is driven from the worker with Sandbox.exec. Its stdout (stream-json) is
-the exec's own output, streamed to a host file as it is produced, so the agent
-can't rewrite it afterwards; it is parsed into our transcript and outcome, and
-the CLI's own logs are kept as artifacts.
 """
 
 from __future__ import annotations

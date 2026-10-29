@@ -26,8 +26,7 @@ but golden path is to capture the data passed to my proxy and form the trajector
 ## Traps
 - afaik, the source code has the peculiarity of asking for OS images that do NOT have python.
 - this seems on purpose.  we are essentially running an experiment, and so i cannot just add python to their env.
-- the evaluation should probably run on its own container.. lots of containers already. wondering if i can do something about it. 
-  - dockerize everything
+
 
 ## Interfaces
 It is clear we need:
