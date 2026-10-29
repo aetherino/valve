@@ -1,0 +1,11 @@
+# mini-swe-agent: the fixed bash-only harness Vals uses for model evals.
+# Runs as a host subprocess in phase 1; becomes a sidecar image in phase 2 (same agent.py).
+name: mini-swe-agent
+version: "2.4.6"
+placement: host
+command: ["python", "agent.py"]
+secrets: [ANTHROPIC_API_KEY, ANTHROPIC_WORKSPACE_ID]   # workspace id only needed for unscoped keys
+defaults:
+  model: anthropic/claude-opus-5-5   # litellm model string
+  step_limit: 50
+  cost_limit_usd: 1.0

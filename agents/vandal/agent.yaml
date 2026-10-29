@@ -1,0 +1,6 @@
+# Test agent (no model, $0): tries to turn its own failure into an infra error,
+# which would drop it from the accuracy denominator. Expect 0% and no infra errors.
+name: vandal
+version: "1"
+placement: host
+command: ["python", "agent.py"]

@@ -1,0 +1,5 @@
+# Test agent (no model, $0). Runs as a host subprocess in phase 1; sidecar image in phase 2.
+name: cheater
+version: "1"
+placement: host
+command: ["python", "agent.py"]

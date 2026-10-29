@@ -1,0 +1,14 @@
+# Harness adapter for the starter's bash-operations benchmark (starter files unchanged).
+name: bash-operations
+version: "1"
+dataset: dataset.json
+fields: { id: task_id, instruction: problem_statement, image: docker_image }
+# Setup and grading scripts are Python; the task image (alpine) has no Python,
+# so they run in this separate tooling image, never in the chamber.
+tooling_image: python:3.11-slim
+prepare: ["python", "setup.py", "--workspace-dir", "{out}", "--task", "{task_id}"]
+eval_paths: []
+verify: ["python", "evaluate.py", "--workspace-dir", "{workspace}", "--task", "{task_id}"]
+result_parser: json_stdout   # evaluate.py prints JSON; exit code 1 just means "failed"
+# The grader only reads files, never executes them, so the whole workspace is the submission.
+submission_paths: ["**"]

@@ -1,0 +1,14 @@
+# secrets
+.env
+.env.*
+# local state
+.vals*/
+workspaces/
+# original starter zip + extracted copy (benchmarks/ is copied from it unchanged)
+starter/
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/

@@ -1,0 +1,33 @@
+[project]
+name = "vals-harness"
+version = "0.1.0"
+description = "Run any agent against any benchmark"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.1",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# Only the mini-swe-agent runner needs this; the harness itself never imports agent code.
+# litellm 1.106 imports `mcp` whenever a request has tools but does not declare it.
+mini = ["mini-swe-agent>=2.4", "mcp"]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+harness = "vals_harness.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vals_harness", "src/vals_agent_sdk"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["docker: needs a running Docker daemon"]

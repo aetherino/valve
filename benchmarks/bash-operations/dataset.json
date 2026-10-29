@@ -1,0 +1,78 @@
+[
+  {
+    "task_id": "bash-001",
+    "problem_statement": "Create a file named 'hello.txt' containing the text 'Hello World'",
+    "docker_image": "alpine:latest",
+    "verification": {
+      "type": "file_content",
+      "file": "hello.txt",
+      "expected_content": "Hello World"
+    },
+    "difficulty": "easy"
+  },
+  {
+    "task_id": "bash-002",
+    "problem_statement": "Create a directory named 'test_dir' and create three empty files inside it: 'file1.txt', 'file2.txt', and 'file3.txt'",
+    "docker_image": "alpine:latest",
+    "verification": {
+      "type": "file_exists",
+      "files": [
+        "test_dir/file1.txt",
+        "test_dir/file2.txt",
+        "test_dir/file3.txt"
+      ]
+    },
+    "difficulty": "easy"
+  },
+  {
+    "task_id": "bash-003",
+    "problem_statement": "Count the number of lines in a file named 'input.txt' and write the count to 'count.txt'",
+    "docker_image": "alpine:latest",
+    "setup": {
+      "files": {
+        "input.txt": "line 1\nline 2\nline 3\nline 4\nline 5"
+      }
+    },
+    "verification": {
+      "type": "file_content",
+      "file": "count.txt",
+      "expected_content": "5"
+    },
+    "difficulty": "easy"
+  },
+  {
+    "task_id": "bash-004",
+    "problem_statement": "List all .txt files in the current directory and save the list to 'txt_files.txt', one filename per line",
+    "docker_image": "alpine:latest",
+    "setup": {
+      "files": {
+        "file1.txt": "",
+        "file2.txt": "",
+        "document.txt": "",
+        "script.sh": "",
+        "data.csv": ""
+      }
+    },
+    "verification": {
+      "type": "file_content_contains",
+      "file": "txt_files.txt",
+      "expected_lines": [
+        "file1.txt",
+        "file2.txt",
+        "document.txt"
+      ]
+    },
+    "difficulty": "easy"
+  },
+  {
+    "task_id": "bash-005",
+    "problem_statement": "Create a file called 'numbers.txt' containing numbers 1 through 10, each on a separate line",
+    "docker_image": "alpine:latest",
+    "verification": {
+      "type": "file_content",
+      "file": "numbers.txt",
+      "expected_content": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10"
+    },
+    "difficulty": "easy"
+  }
+]

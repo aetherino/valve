@@ -1,0 +1,23 @@
+[
+  {
+    "id": "py-001",
+    "prompt": "Write a function called add() that returns 4 (2+2)",
+    "docker_image": "python:3.11-slim",
+    "solution_file": "solution.py",
+    "test_code": "from solution import add\n\ndef test_add():\n    assert add() == 4\n"
+  },
+  {
+    "id": "py-002",
+    "prompt": "Write a function called fibonacci(n) that returns the nth Fibonacci number (0-indexed). For example: fibonacci(0)=0, fibonacci(1)=1, fibonacci(5)=5",
+    "docker_image": "python:3.11-slim",
+    "solution_file": "solution.py",
+    "test_code": "from solution import fibonacci\n\ndef test_fibonacci_base_cases():\n    assert fibonacci(0) == 0\n    assert fibonacci(1) == 1\n\ndef test_fibonacci_sequence():\n    assert fibonacci(2) == 1\n    assert fibonacci(3) == 2\n    assert fibonacci(4) == 3\n    assert fibonacci(5) == 5\n    assert fibonacci(6) == 8\n"
+  },
+  {
+    "id": "py-003",
+    "prompt": "Write a function called get_nth(lst, n) that returns the nth element from a list. If n is out of bounds, return None",
+    "docker_image": "python:3.11-slim",
+    "solution_file": "solution.py",
+    "test_code": "from solution import get_nth\n\ndef test_get_nth_valid():\n    assert get_nth([1, 2, 3, 4, 5], 0) == 1\n    assert get_nth([1, 2, 3, 4, 5], 2) == 3\n    assert get_nth([1, 2, 3, 4, 5], 4) == 5\n\ndef test_get_nth_out_of_bounds():\n    assert get_nth([1, 2, 3], 5) is None\n    assert get_nth([1, 2, 3], -1) is None\n"
+  }
+]

@@ -1,0 +1,22 @@
+# Harness adapter for the starter's python-tasks benchmark (starter files unchanged).
+name: python-tasks
+version: "1"
+dataset: dataset.json
+fields: { id: id, instruction: prompt, image: docker_image }
+# python:3.11-slim + pytest, so prepare.py's `pip install` is already satisfied
+# and grading needs no network.
+tooling_dockerfile: tooling.Dockerfile
+prepare: ["python", "prepare.py", "{task_id}", "--workspace", "{out}"]
+# prepare.py writes the tests into the workspace; we move them out of the chamber
+# and copy them back only at verify time, overwriting any agent-made copy.
+eval_paths: ["test_solution.py"]
+verify: ["python", "grade.py", "{task_id}", "--workspace", "{workspace}"]
+result_parser: json_stdout   # grade.py always exits 0; pass/fail is in the JSON
+# The grader *runs* code from the workspace (`python -m pytest`), so only the
+# solution is carried over. Without this, an agent-written pytest.py or conftest.py
+# hijacks grading (agents/cheater proves it).
+submission_paths: ["solution.py"]
+# grade.py passes on pytest's exit code alone, which the submission can fake
+# (os._exit(0) at import time exits 0 before any test runs). Require pytest's own
+# "N passed" summary line as well.
+pass_requires: ['=+ \d+ passed in [0-9.]+s']
