@@ -31,10 +31,11 @@ def cli() -> None:
 @click.option("--limit", "limits", multiple=True, metavar="KEY=VALUE",
               help=f"Limit override, repeatable. Keys: {', '.join(sorted(LIMIT_KEYS))}")
 @click.option("--expose-eval-files", is_flag=True, help="Let the agent see the tests (default: hidden)")
-@click.option("--wait", is_flag=True, help="Run the trials in this process and print results")
+@click.option("--wait", is_flag=True, help="Run the trials now (in-process worker) and print results")
+@click.option("--slots", default=1, show_default=True, help="With --wait: trials run concurrently")
 @root_option
 def run(agent: str, benchmark: str, task_ids: str | None, model: str | None, attempts: int,
-        limits: tuple[str, ...], expose_eval_files: bool, wait: bool, root: Path) -> None:
+        limits: tuple[str, ...], expose_eval_files: bool, wait: bool, slots: int, root: Path) -> None:
     """Run an agent against a benchmark."""
     paths = service.Paths.from_root(root)
     spec = RunSpec(
@@ -52,7 +53,7 @@ def run(agent: str, benchmark: str, task_ids: str | None, model: str | None, att
     def show(result: dict[str, Any], status: str | None) -> None:
         click.echo("  " + _trial_line(result, status))
 
-    service.work(paths, run_id=run_id, on_result=show)
+    service.work(paths, slots=slots, run_id=run_id, on_result=show)
     _print_summary(results_mod.summarize(Store(paths.db), run_id))
 
 
@@ -100,13 +101,14 @@ def results(run_id: str, fmt: str, root: Path) -> None:
 
 
 @cli.command()
+@click.option("--slots", default=1, show_default=True, help="Trials run concurrently (one child process each)")
 @click.option("--once", is_flag=True, help="Exit when the queue is empty instead of waiting for work")
 @root_option
-def worker(once: bool, root: Path) -> None:
+def worker(slots: int, once: bool, root: Path) -> None:
     """Start a worker that executes queued trials."""
     paths = service.Paths.from_root(root)
-    click.echo("worker started" + (" (exits when queue is empty)" if once else "; Ctrl-C to stop"))
-    service.work(paths, stop_when_empty=once,
+    click.echo(f"worker started with {slots} slot(s)" + (" (exits when queue is empty)" if once else "; Ctrl-C to stop"))
+    service.work(paths, slots=slots, stop_when_empty=once,
                  on_result=lambda r, st: click.echo("  " + r["run_id"] + "  " + _trial_line(r, st)))
 
 
@@ -117,6 +119,21 @@ def cancel(run_id: str, root: Path) -> None:
     """Cancel a run's queued trials (running trials finish normally)."""
     n = service.cancel(service.Paths.from_root(root), run_id)
     click.echo(f"cancelled {n} queued trial(s) of {run_id}")
+
+
+@cli.command()
+@click.option("--dry-run", is_flag=True, help="Only show what would be removed")
+@root_option
+def prune(dry_run: bool, root: Path) -> None:
+    """Remove outdated harness images and leftover containers."""
+    r = service.prune(service.Paths.from_root(root), dry_run=dry_run)
+    verb = "would remove" if dry_run else "removed"
+    for img in r["removed"]:
+        click.echo(f"{verb} {img}")
+    for img in r["refused"]:
+        click.echo(f"kept {img} (in use)")
+    click.echo(f"{verb} {len(r['removed'])} image(s); kept {len(r['kept'])} current; "
+               f"{r['containers_removed']} leftover container(s) removed")
 
 
 # ---------------------------------------------------------------------- helpers

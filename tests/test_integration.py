@@ -71,3 +71,37 @@ def test_sidecar_agent_sees_nothing_of_the_host(root, tmp_path, monkeypatch):
     assert report["declared"] == "s3cret"
     assert "VALS_TEST_UNDECLARED" not in report["env"]
     assert not report["repo_visible"] and not report["home_visible"]
+
+
+def _peak_concurrency(store, run_id):
+    rows = store.db.execute("SELECT started_at, finished_at FROM trials WHERE run_id=?", (run_id,)).fetchall()
+    return max(sum(1 for s, f in rows if s <= t < f) for t, _ in rows)
+
+
+def test_slots_run_trials_concurrently_in_child_processes(root, tmp_path, monkeypatch):
+    monkeypatch.setenv("VALS_HOME", str(tmp_path))
+    paths = service.Paths.from_root(root)
+    run_id = service.submit(paths, RunSpec(agent="agents/oracle", benchmark="python-tasks", attempts=2))
+    service.work(paths, slots=3, run_id=run_id)
+    store = Store(paths.db)
+    s = summarize(store, run_id)
+    assert s["counts"] == {"graded": 6} and s["accuracy"]["mean"] == 1.0
+    assert _peak_concurrency(store, run_id) >= 2
+    assert not any((tmp_path / "jobs").iterdir())
+
+
+def test_trial_wall_clock_kills_the_trial_and_its_containers(root, tmp_path, monkeypatch):
+    import subprocess
+
+    from vals_harness.specs import Policy
+
+    monkeypatch.setenv("VALS_HOME", str(tmp_path))
+    paths = service.Paths.from_root(root)
+    run_id = service.submit(paths, RunSpec(agent="agents/oracle", benchmark="python-tasks", task_ids=["py-001"],
+                                           limits={"trial_timeout_s": 2}, policy=Policy(infra_retries=0)))
+    service.work(paths, run_id=run_id)
+    (t,) = summarize(Store(paths.db), run_id)["trials"]
+    assert t["status"] == "infra_error" and t["error"]["kind"] == "timeout_harness"
+    left = subprocess.run(["docker", "ps", "-aq", "--filter", f"label=vals.run_id={run_id}"],
+                          capture_output=True, text=True).stdout.split()
+    assert left == []

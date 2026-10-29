@@ -93,3 +93,14 @@ def test_accuracy_and_sem_over_attempts_exclude_infra_errors(store, root):
     assert s["accuracy"]["mean"] == pytest.approx(7 / 12)
     assert s["accuracy"]["sem"] == pytest.approx(abs(2 / 3 - 1 / 2) / 2)  # stdev of 2 pts / sqrt(2)
     assert s["cost_usd"] == pytest.approx(5 * 0.1 + 0.05)                # infra try's spend included
+
+
+def test_release_returns_a_trial_without_charging_it(store, root):
+    _enqueue(store, root, attempts=1)
+    c = store.claim("w", 60)
+    assert store.release(c.spec.trial_id, c.token)
+    again = store.claim("w", 60)
+    assert again.spec.trial_id == c.spec.trial_id
+    row = store.db.execute("SELECT infra_attempts FROM trials WHERE id=?", (c.spec.trial_id,)).fetchone()
+    assert row[0] == 0
+    assert not store.release(c.spec.trial_id, c.token)   # the old token is dead

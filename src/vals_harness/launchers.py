@@ -127,17 +127,26 @@ class DockerLauncher:
     def __init__(self) -> None:
         self._images: dict[str, str] = {}
 
-    def image_for(self, agent: AgentSpec) -> str:
-        """Build the agent image once per content hash of (agent folder + SDK)."""
-        if agent.name in self._images:
-            return self._images[agent.name]
+    @staticmethod
+    def _recipe(agent: AgentSpec) -> bytes:
         dockerfile = agent.root / "Dockerfile"
-        recipe = dockerfile.read_bytes() if dockerfile.exists() else DEFAULT_AGENT_DOCKERFILE.encode()
-        h = hashlib.sha256(recipe)
+        return dockerfile.read_bytes() if dockerfile.exists() else DEFAULT_AGENT_DOCKERFILE.encode()
+
+    @classmethod
+    def tag_for(cls, agent: AgentSpec) -> str:
+        """Tag = content hash of (Dockerfile + agent folder + SDK)."""
+        h = hashlib.sha256(cls._recipe(agent))
         for base in (agent.root, SDK_DIR):
             for f in sorted(p for p in base.rglob("*") if p.is_file() and "__pycache__" not in p.parts):
                 h.update(str(f.relative_to(base)).encode() + b"\0" + f.read_bytes())
-        tag = f"vals/agent-{agent.name}:{h.hexdigest()[:12]}"
+        return f"vals/agent-{agent.name}:{h.hexdigest()[:12]}"
+
+    def image_for(self, agent: AgentSpec) -> str:
+        """Build the agent image once per content hash."""
+        if agent.name in self._images:
+            return self._images[agent.name]
+        recipe = self._recipe(agent)
+        tag = self.tag_for(agent)
         if _docker(["image", "inspect", tag], check=False).returncode != 0:
             with tempfile.TemporaryDirectory(prefix="vals-agent-build-") as ctx:
                 # Build context = the agent folder + the SDK, nothing else from the repo.

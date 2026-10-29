@@ -33,10 +33,17 @@ class Limits(Frozen):
     timeout_s: int = 600            # agent wall clock
     command_timeout_s: int = 30     # one Chamber API exec
     verify_timeout_s: int = 120     # grading
+    trial_timeout_s: int | None = None  # whole trial; None = timeout_s + verify_timeout_s + 900 (image builds)
     step_limit: int = 50
     cost_limit_usd: float = 1.0
     cpus: float = 1.0
     memory: str = "1g"
+
+
+def trial_budget_s(limits: "Limits") -> int:
+    """Wall clock for a whole trial, enforced by the worker by killing the trial process.
+    The default leaves 15 min for prepare (first-time image builds) and cleanup."""
+    return limits.trial_timeout_s or limits.timeout_s + limits.verify_timeout_s + 900
 
 
 class Policy(Frozen):

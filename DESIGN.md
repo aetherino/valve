@@ -356,15 +356,16 @@ The fully resolved RunSpec for one `(task_id, attempt)`, plus `inputs_digest`: c
 **Topology: the worker runs on the host**, talking to Docker through the normal CLI/SDK. The Chamber API uses each agent container's stdio (§5.1), which avoids a Docker Desktop for Mac limitation found in testing: a unix socket created on the macOS host and bind-mounted into a container is visible but refuses connections. Because the worker, CLI and DB all live on the host, SQLite stays safe.
 
 ```
-harness worker --slots 4
-   │  loop: while free slot → claim one queued trial (atomic UPDATE … RETURNING)
-   ├─ slot 1 → subprocess: harness _trial <trial_id>   ─▶ tooling → chamber → verifier
-   ├─ slot 2 → subprocess ...
-   └─ heartbeat: renew leases of its running trials every 10 s
+harness worker --slots 4                      (supervisor; the only writer of final results)
+   │  loop: collect finished children → fill free slots (claim) → renew leases every 10 s
+   ├─ slot 1 → python -m vals_harness.trial_child <job> <result>   ─▶ tooling → chamber + agent → verifier
+   ├─ slot 2 → …                                  (own process group; result written atomically to a file)
+   └─ trial wall clock: kill process group + reap by claim label → infra_error (timeout_harness)
 ```
 
 - **Slot = the resource unit.** One trial runs at most 2 containers at once (chamber + sidecar, or chamber alone), each capped by `limits.cpus/memory`. Size slots so `slots × per-trial limits ≤ machine`.
-- **Trial runs in a child process** (phase 3). Crashes and hangs are isolated; enforcing the trial wall clock = kill the child + `docker rm -f` by the claim's label.
+- **Each trial runs in a child process** in its own process group. A crash or hang is isolated to that trial: a child that exits without a result becomes `infra_error` (`adapter`); one that overruns `trial_budget_s` (default: agent timeout + verify timeout + 15 min for image builds; override with `--limit trial_timeout_s=…`) is killed with its whole group, its containers are reaped by claim label, and it's recorded as `timeout_harness`.
+- **Clean shutdown.** On Ctrl-C the supervisor kills its children, reaps their containers and *releases* their claims back to the queue (fenced, no infra attempt charged).
 - **Multiple workers are fine.** Each claims atomically from SQLite (WAL mode). Multi-host would need Postgres; out of scope.
 - **Leases.** A claimed trial has `lease_until`, renewed every 10 s. An expired lease (dead worker) lets another worker reclaim it, counting one infra attempt; past `policy.infra_retries` the trial is closed as `infra_error` (`worker_lost`) instead of being handed out forever.
 - **Fencing tokens.** Every claim gets a fresh `claim_token`; every later write (`set_status`, `heartbeat`, `finish`) must present it. A worker that stalled past its lease is fenced out: its writes fail (`LostLease`), its result is dropped, and because containers and artifact folders are per claim (`vals.claim` label, `try<N>/` folder) it can't delete or overwrite the new owner's.
@@ -400,7 +401,7 @@ Trial states: `queued → preparing → running_agent → verifying → graded |
 }
 ```
 
-`error` when `infra_error`: `{ "kind": "image" | "docker" | "prepare" | "adapter" | "verifier" | "worker_lost" | "timeout_harness", "message": "…" }` (`timeout_harness` arrives with the phase-3 trial wall clock). Results also carry `try` (1 + infra retries) and per-trial `spent_usd` summed over every try.
+`error` when `infra_error`: `{ "kind": "image" | "docker" | "prepare" | "adapter" | "verifier" | "worker_lost" | "timeout_harness", "message": "…" }` (`timeout_harness` = the trial wall clock ran out). Results also carry `try` (1 + infra retries) and per-trial `spent_usd` summed over every try.
 
 ### 8.2 RunResult (`harness results`)
 
@@ -451,16 +452,17 @@ The run report is a SQL aggregation over `runs ⋈ trials ⋈ results`.
 ## 11. CLI and phases
 
 ```
-harness run --agent agents/mini-swe-agent --benchmark bash-operations [--task_ids a,b] [--model …] [--attempts 3] [--wait]
+harness run --agent agents/mini-swe-agent --benchmark bash-operations [--task_ids a,b] [--model …] [--attempts 3] [--wait [--slots N]]
 harness status [--run_id ID]        # no id → list active runs
 harness results --run_id ID [--format json|table|summary]
-harness worker [--once]            # --slots N in phase 3
+harness worker [--slots N] [--once]
+harness prune [--dry-run]          # outdated vals/* images + dead workers' containers
 harness cancel --run_id ID
 ```
 
 1. ✅ `Sandbox` (Docker) + both benchmark adapters + mini-swe-agent on `host` placement + `run --wait` + SQLite + results.
 2. ✅ `DockerLauncher`: every agent runs in its own sidecar container (`docker run -i`, same stdio protocol). Agent images are built in PREPARE from the agent folder + SDK (default Dockerfile, or the agent's own), tagged by content hash, and pinned by id in the manifest. Secrets passed as `-e NAME` (never on the command line); the container has no mounts, egress for model calls, the standard hardening, and is removed by name on kill.
-3. Queue, workers, leases, `status`.
+3. ✅ Worker supervisor: N slots, one child process per trial, trial wall clock, clean release on shutdown; `harness prune`.
 4. Claude Code, installed (Harbor pattern).
 5. Stretch: Claude Code via `shell_relay` (spike first), model proxy, network lockdown.
 
@@ -471,7 +473,7 @@ harness cancel --run_id ID
 | Per command | 30 s (mini's default) | Chamber API / `Sandbox.exec` | command returns `timed_out: true`; agent continues |
 | Agent wall clock | 10 min | recv deadline → `cancel` + 10 s grace (only finish/event/artifact accepted); a watchdog kills the agent process 5 s later even if the worker is blocked writing to an agent that stopped reading | `exit_status: timeout`, graded |
 | Verify | 2 min | in-container `timeout` | graded 0 (the submission runs inside the grader, so a hang is the agent's) |
-| Trial wall clock | agent + verify + 5 min | phase 3: worker kills trial subprocess + label cleanup | `infra_error` (kind `timeout_harness`) |
+| Trial wall clock | agent + verify + 15 min (`trial_timeout_s`) | supervisor kills the trial's process group + reaps by claim label | `infra_error` (kind `timeout_harness`) |
 | Lease | 60 s, renewed every 10 s | DB | trial requeued |
 
 ## 13. Testing without a model
@@ -489,7 +491,7 @@ They run as sidecar containers like any other agent; a further integration test 
 ```
 vals-harness/
 ├── src/vals_harness/       cli.py · service.py · specs.py · sandbox/ (Sandbox, docker.py) · benchmarks.py · protocol.py
-│                           launchers.py · chamber_api.py · trial.py · store.py · results.py · errors.py
+│                           launchers.py · chamber_api.py · trial.py · trial_child.py · store.py · results.py · errors.py
 ├── src/vals_agent_sdk/     client.py (agent side of vals-agent/1, stdlib only)
 ├── agents/                 mini-swe-agent/ · oracle/ · noop/ · cheater/ · vandal/   (claude-code/ in phase 4)
 ├── benchmarks/             bash-operations/ · python-tasks/   (starter files untouched + harness.yaml)

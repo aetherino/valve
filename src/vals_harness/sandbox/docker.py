@@ -208,14 +208,20 @@ class DockerSandboxProvider:
             found = _docker(["image", "inspect", "--format", "{{.Id}}", image], kind="image")
         return found.stdout.decode().strip()
 
-    def _build(self, dockerfile: Path) -> str:
-        """Build once per content hash of the Dockerfile's folder (the build context)."""
+    @staticmethod
+    def tooling_tag(dockerfile: Path) -> str:
+        """Tag = content hash of the Dockerfile's folder (the build context)."""
         context = dockerfile.parent
         h = hashlib.sha256()
         for f in sorted(p for p in context.rglob("*") if p.is_file()):
             h.update(str(f.relative_to(context)).encode())
             h.update(f.read_bytes())
-        tag = f"vals/{context.name}-tooling:{h.hexdigest()[:12]}"
+        return f"vals/{context.name}-tooling:{h.hexdigest()[:12]}"
+
+    def _build(self, dockerfile: Path) -> str:
+        """Build once per content hash of the build context."""
+        context = dockerfile.parent
+        tag = self.tooling_tag(dockerfile)
         if _docker(["image", "inspect", tag], check=False).returncode != 0:
             _docker(["build", "-q", "-t", tag, "-f", str(dockerfile), str(context)], timeout=900, kind="image")
         return tag
@@ -265,3 +271,19 @@ class DockerSandboxProvider:
             return len(stale)
         except InfraError:
             return 0
+
+
+def vals_images() -> list[str]:
+    """Every locally built harness image (repository vals/*), as repo:tag."""
+    out = _docker(["images", "--format", "{{.Repository}}:{{.Tag}}", "--filter", "reference=vals/*"],
+                  check=False, timeout=60).stdout.decode()
+    return [line for line in out.split() if line and not line.endswith(":<none>")]
+
+
+def remove_images(refs: list[str]) -> list[str]:
+    """Remove images; returns the ones Docker refused (e.g. still used by a container)."""
+    refused = []
+    for ref in refs:
+        if _docker(["rmi", ref], check=False, timeout=120).returncode != 0:
+            refused.append(ref)
+    return refused

@@ -183,6 +183,13 @@ class Store:
             self._write_result(trial_id, status, result)
         return status
 
+    def release(self, trial_id: str, token: str) -> bool:
+        """Give a claimed trial back to the queue without charging an infra attempt
+        (the worker is shutting down cleanly). Fenced like every other write."""
+        cur = self.db.execute("UPDATE trials SET status='queued', claim_token=NULL, worker_id=NULL,"
+                              " lease_until=NULL WHERE id=? AND claim_token=?", (trial_id, token))
+        return cur.rowcount == 1
+
     def cancel_run(self, run_id: str) -> int:
         """Cancel trials not yet started. Running trials finish normally."""
         with self._tx():
