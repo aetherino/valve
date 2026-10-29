@@ -105,3 +105,23 @@ def test_trial_wall_clock_kills_the_trial_and_its_containers(root, tmp_path, mon
     left = subprocess.run(["docker", "ps", "-aq", "--filter", f"label=vals.run_id={run_id}"],
                           capture_output=True, text=True).stdout.split()
     assert left == []
+
+
+@pytest.mark.parametrize("benchmark", ["bash-operations", "python-tasks"])
+def test_saboteur_stopping_its_chamber_is_graded_not_infra(root, tmp_path, monkeypatch, benchmark):
+    """`kill 1`, killing the keep-alive process and `kill -9 -1` stop the chamber from the
+    inside; a submission that kills the verifier's PID 1 stops the grader. All graded 0,
+    with the agent's reported spend kept."""
+    monkeypatch.setenv("VALS_HOME", str(tmp_path))
+    paths = service.Paths.from_root(root)
+    run_id = service.submit(paths, RunSpec(agent="agents/saboteur", benchmark=benchmark))
+    service.work(paths, slots=3, run_id=run_id)
+    s = summarize(Store(paths.db), run_id)
+    assert s["counts"] == {"graded": len(s["trials"])}, s["trials"]
+    assert s["accuracy"]["mean"] == 0.0
+    for t in s["trials"]:
+        assert t["agent"]["exit_status"] == "agent_error", t["agent"]
+        assert "stopped its chamber" in t["agent"]["message"], t["agent"]
+        assert t["metrics"]["cost_usd"] == 0.25 and t["spent_usd"] == 0.25
+        if benchmark == "python-tasks":
+            assert "submission stopped the grader" in t["grade"]["details"]["harness"]["error"], t["grade"]

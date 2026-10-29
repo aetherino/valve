@@ -33,6 +33,12 @@ SUBMIT_MARKER = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
 # mini exit statuses -> protocol exit statuses
 EXIT_MAP = {"Submitted": "submitted", "LimitsExceeded": "step_limit", "TimeExceeded": "timeout"}
 
+# Clearly the model provider's failure, not the agent's (ContextWindowExceeded etc. are the agent's).
+_X = litellm.exceptions
+PROVIDER_ERRORS = (_X.AuthenticationError, _X.PermissionDeniedError, _X.NotFoundError, _X.RateLimitError,
+                   _X.ServiceUnavailableError, _X.BadGatewayError, _X.InternalServerError,
+                   _X.APIConnectionError, _X.Timeout, _X.PaymentRequiredError)
+
 
 class ChamberEnvironment:
     """Implements mini's environment interface (execute / get_template_vars / serialize)."""
@@ -43,8 +49,10 @@ class ChamberEnvironment:
         self.timeout = timeout
         self.cwd = cwd
         # mini's prompt mentions the OS it runs on. Report the chamber's, not this
-        # machine's, so the agent sees one consistent world.
-        lines = client.exec("uname -s; uname -r; uname -v; uname -m")["output"].splitlines()
+        # machine's, so the agent sees one consistent world. The harness sends it in
+        # `start`; asking the chamber is the fallback (it counts as a chamber command).
+        uname = client.chamber.get("uname") or client.exec("uname -s; uname -r; uname -v; uname -m")["output"]
+        lines = uname.splitlines()
         self.uname = dict(zip(("system", "release", "version", "machine"), (lines + [""] * 4)[:4]))
 
     def execute(self, action: dict, cwd: str = "", *, timeout: int | None = None) -> dict[str, Any]:
@@ -104,7 +112,11 @@ def main() -> None:
         info = agent.run(client.instruction)
         exit_status = EXIT_MAP.get(info.get("exit_status", ""), "agent_error")
         message = info.get("exit_status", "")
-    except Exception as e:  # model/API errors end the attempt; they are the agent's failure
+    except PROVIDER_ERRORS as e:
+        # The provider failed (bad key, rate limit, overload, unknown model). The harness
+        # treats this as its own failure (retried) only if no command reached the chamber.
+        exit_status, message = "model_error", f"{type(e).__name__}: {e}"
+    except Exception as e:  # anything else ends the attempt as the agent's failure
         message = f"{type(e).__name__}: {e}"
     finally:
         client.artifact("trajectory.json", json.dumps(agent.serialize(), indent=1, default=str))

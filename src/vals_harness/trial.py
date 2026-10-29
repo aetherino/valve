@@ -24,7 +24,7 @@ from vals_harness.phantom import create_volumes as phantom_volumes
 from vals_harness.phantom import remove_volumes as remove_phantom_volumes
 from vals_harness.launchers import AgentLauncher, DockerLauncher, HostLauncher
 from vals_harness.sandbox import SandboxProvider
-from vals_harness.specs import TrialSpec
+from vals_harness.specs import TrialSpec, folder_digest, missing_secrets
 from vals_harness.store import Claim, LostLease, Store
 
 WORKSPACE = "/workspace"
@@ -49,8 +49,12 @@ class TrialRecorder:
         self._transcript.flush()
 
     def artifact(self, name: str, data: bytes) -> None:
+        self.artifact_path(name).write_bytes(data)
+
+    def artifact_path(self, name: str) -> Path:
+        """Where an artifact goes, for writers that stream (big tars, CLI output)."""
         safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in name)[:100].lstrip(".") or "artifact"
-        (self.folder / "agent_logs" / safe).write_bytes(data)
+        return self.folder / "agent_logs" / safe
 
     def close(self) -> None:
         self._transcript.close()
@@ -72,7 +76,8 @@ class TrialRunner:
         folder = self.artifacts_root / spec.run_id / spec.trial_id / f"try{claim.try_no}"
         folder.mkdir(parents=True, exist_ok=True)
         rec = TrialRecorder(self.store, spec.trial_id, claim.try_no, folder)
-        labels = {"vals.trial_id": spec.trial_id, "vals.run_id": spec.run_id, "vals.claim": claim.token}
+        labels = {"vals.trial_id": spec.trial_id, "vals.run_id": spec.run_id, "vals.claim": claim.token,
+                  "vals.home": self.store.home_id}
         t0 = time.monotonic()
         timings: dict[str, float] = {}
         outcome: AgentOutcome | None = None
@@ -81,6 +86,7 @@ class TrialRunner:
         try:
             # 1 PREPARE
             self._phase(claim, rec, "preparing")
+            self._check_inputs(spec)
             bench = BenchmarkAdapter(spec.benchmark, self.provider)
             placement = spec.agent.placement
             launcher = self.launchers.get(placement) if placement in ("host", "sidecar") else None
@@ -127,9 +133,13 @@ class TrialRunner:
                         session = launcher.launch(spec.agent, folder / "agent_stderr.log", labels)  # type: ignore[union-attr]
                     api = ChamberApi(chamber, rec, trial_id=spec.trial_id,
                                      command_timeout_s=spec.limits.command_timeout_s)
-                    outcome = api.serve(session, self._start_payload(spec), deadline=deadline)
+                    outcome = api.serve(session, self._start_payload(spec, chamber), deadline=deadline)
                 self._collect(chamber, folder / "workspace.tar", rec)
             timings["agent_s"] = time.monotonic() - t_agent
+            if outcome.exit_status == "model_error":
+                # The model provider failed before the agent did anything (ChamberApi and the
+                # installed parser only allow this status then): not the agent's failure.
+                raise InfraError("model_api", outcome.message or "model provider error")
 
             # 5 VERIFY
             self._phase(claim, rec, "verifying")
@@ -170,13 +180,31 @@ class TrialRunner:
     # ------------------------------------------------------------------ helpers
 
     @staticmethod
+    def _check_inputs(spec: TrialSpec) -> None:
+        """The trial runs whatever is in the folders now; make sure that's what was submitted,
+        and that the agent's required secrets are here (this process may not be the submitter)."""
+        now = {"benchmark": folder_digest(spec.benchmark.root), "agent": folder_digest(spec.agent.root)}
+        changed = sorted(k for k, v in now.items() if spec.inputs_digest.get(k) != v)
+        if changed:
+            raise InfraError("adapter", f"inputs changed since submit: {', '.join(changed)} folder "
+                                        "(resubmit the run to use the new version)")
+        if missing := missing_secrets(spec.agent):
+            raise InfraError("config", f"agent {spec.agent.name} needs {', '.join(missing)}, not set for the worker")
+
+    @staticmethod
     def _collect(chamber: Any, tar_path: Path, rec: TrialRecorder) -> None:
-        """Snapshot /workspace. If that fails while the chamber is still running, the agent
-        broke its own workspace (e.g. `rm -rf /workspace`): an empty submission, graded."""
+        """Stop everything in the chamber, then snapshot /workspace from the stopped container.
+
+        Halting first means nothing the agent left running keeps writing during the copy.
+        If the snapshot fails while the container still exists, the agent broke its own
+        workspace (e.g. `rm -rf /workspace`): an empty submission, graded. If the container
+        is gone, Docker failed: infra_error.
+        """
+        chamber.halt()
         try:
             chamber.snapshot(WORKSPACE, tar_path)
         except InfraError as e:
-            if not chamber.alive():
+            if not chamber.exists():
                 raise
             tar_path.unlink(missing_ok=True)
             rec.event("snapshot_missing", {"reason": e.message})
@@ -186,10 +214,16 @@ class TrialRunner:
         rec.event("phase", {"status": status})
 
     @staticmethod
-    def _start_payload(spec: TrialSpec) -> dict[str, Any]:
+    def _start_payload(spec: TrialSpec, chamber: Any) -> dict[str, Any]:
+        # The chamber's uname, asked by the harness so an agent (mini puts it in its prompt)
+        # needn't run a command before its first model call (see `model_error`).
+        try:
+            uname = chamber.exec("uname -s; uname -r; uname -v; uname -m", timeout=30).output
+        except Exception:
+            uname = ""
         return {"instruction": spec.task.instruction, "config": spec.agent_config(),
                 "task": {"id": spec.task.id}, "workspace": WORKSPACE,
-                "deadline_unix": time.time() + spec.limits.timeout_s}
+                "deadline_unix": time.time() + spec.limits.timeout_s, "chamber": {"uname": uname}}
 
     @staticmethod
     def _write_manifest(spec: TrialSpec, pins: dict[str, str], folder: Path) -> None:

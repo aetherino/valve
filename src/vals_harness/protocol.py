@@ -19,6 +19,7 @@ INVALID_PARAMS = -32602
 CHAMBER_ERROR = -32000      # the chamber is broken -> infra_error
 NOT_FOUND = -32001          # e.g. `get` on a missing file
 CANCELLED = -32002          # deadline passed; only finish/event/artifact accepted
+CHAMBER_STOPPED = -32003    # the agent stopped its own chamber; session ends, still graded
 
 
 class TransportClosed(Exception):

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any, Literal
 
@@ -33,17 +34,23 @@ class Limits(Frozen):
     timeout_s: int = 600            # agent wall clock
     command_timeout_s: int = 30     # one Chamber API exec
     verify_timeout_s: int = 120     # grading
-    trial_timeout_s: int | None = None  # whole trial; None = timeout_s + verify_timeout_s + 900 (image builds)
+    trial_timeout_s: int | None = None  # whole trial; None = timeout_s + verify_timeout_s + PREPARE_SLACK_S
     step_limit: int = 50
     cost_limit_usd: float = 1.0
     cpus: float = 1.0
     memory: str = "1g"
 
 
+# Room in the default trial wall clock for PREPARE and cleanup. First-time image work
+# happens inside the trial: worst case a task-image pull (600 s) + a tooling build (900 s)
+# + an agent build (sidecar 1200 s / installed 1800 s) + the prepare script (300 s) =
+# 3600 s. Each of those has its own timeout (InfraError "image"); a test keeps them in sync.
+PREPARE_SLACK_S = 3600
+
+
 def trial_budget_s(limits: "Limits") -> int:
-    """Wall clock for a whole trial, enforced by the worker by killing the trial process.
-    The default leaves 15 min for prepare (first-time image builds) and cleanup."""
-    return limits.trial_timeout_s or limits.timeout_s + limits.verify_timeout_s + 900
+    """Wall clock for a whole trial, enforced by the worker by killing the trial process."""
+    return limits.trial_timeout_s or limits.timeout_s + limits.verify_timeout_s + PREPARE_SLACK_S
 
 
 class Policy(Frozen):
@@ -133,7 +140,8 @@ class AgentSpec(Frozen):
     placement: Literal["host", "sidecar", "installed", "phantom"]
     command: list[str] = []                 # how to start the agent runner (host/sidecar)
     installed: InstalledRuntime | None = None   # placement: installed / phantom
-    secrets: list[str] = []                 # env var names forwarded to the agent only
+    secrets: list[str] = []                 # env var names forwarded to the agent only; required
+    optional_secrets: list[str] = []        # forwarded if set (e.g. ANTHROPIC_WORKSPACE_ID)
     defaults: dict[str, Any] = {}           # model + limit defaults
     root: Path                              # set by the loader: the agent folder
 
@@ -144,6 +152,12 @@ class AgentSpec(Frozen):
         if self.placement in ("host", "sidecar") and not self.command:
             raise ValueError(f"placement: {self.placement} needs a `command`")
         return self
+
+
+def missing_secrets(agent: AgentSpec) -> list[str]:
+    """Required secrets not set in this process's environment. A trial without its API
+    key would fail at the provider and be graded 0, so this is checked up front."""
+    return [k for k in agent.secrets if not os.environ.get(k)]
 
 
 def load_agent(ref: str, root: Path) -> AgentSpec:

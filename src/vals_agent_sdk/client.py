@@ -50,6 +50,9 @@ class AgentClient:
         self.config: dict[str, Any] = p.get("config", {})
         self.task: dict[str, Any] = p.get("task", {})
         self.workspace: str = p.get("workspace", "/workspace")
+        # Facts about the chamber the harness already knows (`uname`), so an agent needn't
+        # spend a chamber command on them before its model has done anything.
+        self.chamber: dict[str, Any] = p.get("chamber") or {}
 
     # ------------------------------------------------------------------ wire
 
@@ -104,7 +107,8 @@ class AgentClient:
         self._request("artifact", {"name": name, "data_b64": base64.b64encode(raw).decode()})
 
     def finish(self, exit_status: str, **usage: Any) -> None:
-        """exit_status: submitted | step_limit | cost_limit | timeout | agent_error | gave_up.
+        """exit_status: submitted | step_limit | cost_limit | timeout | agent_error | gave_up
+        | model_error (the model provider failed; only honoured before any chamber command).
         usage: steps, input_tokens, output_tokens, cost_usd, message."""
         try:
             self._request("finish", {"exit_status": exit_status, **usage})

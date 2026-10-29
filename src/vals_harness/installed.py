@@ -7,8 +7,10 @@ image, so:
     (cached by content hash, pinned by id in the manifest), never installed live;
   - the chamber needs egress for model calls (v2: model proxy only);
   - secrets reach the CLI's environment via `docker exec -e NAME`, never argv.
-The CLI is driven from the worker with Sandbox.exec; its own transcript is parsed
-into our transcript and its logs are kept as artifacts.
+The CLI is driven from the worker with Sandbox.exec. Its stdout (stream-json) is
+the exec's own output, streamed to a host file as it is produced, so the agent
+can't rewrite it afterwards; it is parsed into our transcript and outcome, and
+the CLI's own logs are kept as artifacts.
 """
 
 from __future__ import annotations
@@ -18,70 +20,88 @@ import json
 import os
 import re
 import shlex
-import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable
 
-from vals_harness.chamber_api import AgentOutcome, Recorder
-from vals_harness.errors import InfraError
+from vals_harness.chamber_api import AgentOutcome, Recorder, safe_num
+from vals_harness.errors import ChamberStopped, InfraError
 from vals_harness.sandbox import Sandbox
 from vals_harness.sandbox.docker import _docker
-from vals_harness.specs import AgentSpec, InstalledRuntime, TrialSpec
+from vals_harness.specs import AgentSpec, InstalledRuntime, TrialSpec, folder_digest
 
 WORK = "/tmp/vals"           # outside /workspace, so none of this is part of the submission
 INSTRUCTION = f"{WORK}/instruction.txt"
-OUTPUT = f"{WORK}/output.jsonl"
 STDERR = f"{WORK}/stderr.log"
 WORKSPACE = "/workspace"
+INSTALLED_BUILD_TIMEOUT_S = 1800   # see specs.PREPARE_SLACK_S
 
 
 class InstalledRunner:
+    @staticmethod
+    def base_tag(task_image_id: str) -> str:
+        """FROM needs a name, so the pinned task image id gets a tag that can't move."""
+        return f"vals/base:{task_image_id.removeprefix('sha256:')[:16]}"
+
+    @staticmethod
+    def tag_for(agent: AgentSpec, task_image_id: str) -> str:
+        """Tag = hash of the whole build context (the agent folder) + the task image id."""
+        h = hashlib.sha256((folder_digest(agent.root) + task_image_id).encode()).hexdigest()[:12]
+        return f"vals/installed-{agent.name}:{h}"
+
     def prepare(self, agent: AgentSpec, task_image_id: str) -> str:
         """Build (once) task image + agent runtime; return the new image id."""
         rt = _runtime(agent)
-        recipe = (agent.root / rt.dockerfile).read_bytes()
-        base = f"vals/base:{task_image_id.removeprefix('sha256:')[:16]}"
-        h = hashlib.sha256(recipe + task_image_id.encode()).hexdigest()[:12]
-        tag = f"vals/installed-{agent.name}:{h}"
+        base, tag = self.base_tag(task_image_id), self.tag_for(agent, task_image_id)
         if _docker(["image", "inspect", tag], check=False).returncode != 0:
-            # FROM needs a name, so give the pinned id a tag that can't move.
             _docker(["tag", task_image_id, base])
             _docker(["build", "-q", "--build-arg", f"BASE={base}", "-t", tag,
-                     "-f", str(agent.root / rt.dockerfile), str(agent.root)], timeout=1800, kind="image")
-        return _docker(["image", "inspect", "--format", "{{.Id}}", tag]).stdout.decode().strip()
+                     "-f", str(agent.root / rt.dockerfile), str(agent.root)],
+                    timeout=INSTALLED_BUILD_TIMEOUT_S, kind="image")
+        return _docker(["image", "inspect", "--format", "{{.Id}}", tag], kind="image").stdout.decode().strip()
 
     def run(self, spec: TrialSpec, chamber: Sandbox, rec: Recorder, deadline: float) -> AgentOutcome:
         rt = _runtime(spec.agent)
         chamber.put(INSTRUCTION, spec.task.instruction.encode())
         cmd = rt.run.format(model=shlex.quote(spec.model or ""), max_turns=int(spec.limits.step_limit))
-        script = f"mkdir -p {rt.logs_dir} && {cmd} < {INSTRUCTION} > {OUTPUT} 2> {STDERR}"
+        # No `> file`: stdout goes to the docker exec client and streams into the artifact folder.
+        script = f"mkdir -p {rt.logs_dir} && {cmd} < {INSTRUCTION} 2> {STDERR}"
+        output_path = rec.artifact_path("output.jsonl")
         timeout = max(1, int(deadline - time.monotonic()))
-        r = chamber.exec(script, timeout=timeout, cwd=WORKSPACE, env=_public_env(rt), secret_env=_secret_env(spec.agent, rt))
-        rec.event("installed_agent_exit", {"returncode": r.returncode, "timed_out": r.timed_out,
-                                           "duration_s": r.duration_s})
+        stopped: str | None = None
+        timed_out = False
+        try:
+            r = chamber.exec(script, timeout=timeout, cwd=WORKSPACE, env=_public_env(rt),
+                             secret_env=_secret_env(spec.agent, rt), stdout_path=output_path)
+            timed_out = r.timed_out
+            rec.event("installed_agent_exit", {"returncode": r.returncode, "timed_out": r.timed_out,
+                                               "duration_s": r.duration_s, "stderr_tail": r.output[-500:]})
+        except ChamberStopped as e:   # e.g. the agent ran `kill 1`: its failure, still graded
+            stopped = str(e)
+            rec.event("chamber_stopped", {"reason": stopped})
 
-        output = _get_text(chamber, OUTPUT)
-        rec.artifact("output.jsonl", output.encode())
         rec.artifact("stderr.log", _get_text(chamber, STDERR).encode())
         self._collect_logs(chamber, rt.logs_dir, rec)
 
-        outcome = PARSERS[rt.output_parser](output, rec)
-        if r.timed_out:
-            outcome.exit_status = "timeout"
-            outcome.message = "agent wall-clock limit reached"
+        try:
+            output = output_path.read_text(errors="replace") if output_path.exists() else ""
+            outcome = PARSERS[rt.output_parser](output, rec)
+        except Exception as e:  # the output is the agent's: never a harness failure
+            outcome = AgentOutcome("agent_error", message=f"unparseable agent output: {type(e).__name__}: {e}"[:2000])
+        if stopped:
+            outcome.exit_status, outcome.message = "agent_error", f"agent stopped its chamber: {stopped}"
+        elif timed_out:
+            outcome.exit_status, outcome.message = "timeout", "agent wall-clock limit reached"
         return outcome
 
     @staticmethod
     def _collect_logs(chamber: Sandbox, logs_dir: str, rec: Recorder) -> None:
-        """The CLI's own session logs, kept as one tar artifact (best effort)."""
-        with tempfile.TemporaryDirectory() as d:
-            tar = Path(d) / "logs.tar"
-            try:
-                chamber.snapshot(logs_dir, tar)
-            except InfraError:
-                return
-            rec.artifact("agent_logs.tar", tar.read_bytes())
+        """The CLI's own session logs, streamed as one tar into the artifact folder (best effort)."""
+        tar = rec.artifact_path("agent_logs.tar")
+        try:
+            chamber.snapshot(logs_dir, tar)
+        except InfraError:
+            tar.unlink(missing_ok=True)
 
 
 def _runtime(agent: AgentSpec) -> InstalledRuntime:
@@ -96,8 +116,9 @@ def _public_env(rt: InstalledRuntime) -> dict[str, str]:
 
 def _secret_env(agent: AgentSpec, rt: InstalledRuntime) -> dict[str, str]:
     """Declared secrets, plus env entries that reference worker variables ("${VAR}").
-    An entry whose variables aren't set is skipped rather than sent half-filled."""
-    out = {k: os.environ[k] for k in agent.secrets if k in os.environ}
+    An entry whose variables aren't set is skipped rather than sent half-filled.
+    (Missing *required* secrets are caught earlier, at submit and in PREPARE.)"""
+    out = {k: os.environ[k] for k in [*agent.secrets, *agent.optional_secrets] if k in os.environ}
     for key, template in rt.env.items():
         refs = re.findall(r"\$\{(\w+)\}", template)
         if refs and all(r in os.environ for r in refs):
@@ -114,41 +135,83 @@ def _get_text(chamber: Sandbox, path: str) -> str:
 
 # ---------------------------------------------------------------- output parsers
 
+# A Claude Code `result` with is_error that is clearly the model provider failing
+# (bad key, no permission, unknown model, rate limit, overload, 5xx), not the agent.
+PROVIDER_ERROR = re.compile(
+    r"API Error: (401|403|404|408|429|500|502|503|504|529)\b|authentication_error|permission_error"
+    r"|rate_limit_error|overloaded_error|Invalid API key|Credit balance is too low", re.IGNORECASE)
+
+
+def _dict(v: Any) -> dict[str, Any]:
+    return v if isinstance(v, dict) else {}
+
+
+def _tokens(usage: dict[str, Any]) -> tuple[int, int]:
+    tin = sum(safe_num(usage.get(k), int) for k in
+              ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+    return tin, safe_num(usage.get("output_tokens"), int)
+
 
 def parse_claude_stream_json(output: str, rec: Recorder) -> AgentOutcome:
     """Claude Code `--output-format stream-json`: one JSON event per line, ending with
     a `result` event (subtype, num_turns, total_cost_usd, usage). Tool calls become
-    transcript entries; anything unparseable is skipped (it's the agent's output)."""
+    transcript entries. Everything here is agent output: unparseable lines are skipped
+    and every number is sanitized (non-negative, finite), never trusted.
+
+    No result event (e.g. the CLI was killed at the wall clock): tokens are summed from
+    the assistant events instead (each message once; the CLI repeats usage per block).
+    A provider failure (PROVIDER_ERROR) before the agent ran a single tool becomes
+    exit status `model_error` (-> infra_error, retried). After a tool ran, the agent
+    could have forged the line (it can write to the CLI's stdout), so it's graded.
+    """
     n_tools, result = 0, None
-    for line in output.splitlines():
+    usage_by_msg: dict[str, dict[str, Any]] = {}
+    for i, line in enumerate(output.splitlines()):
         try:
             ev = json.loads(line)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             continue
         if not isinstance(ev, dict):
             continue
         if ev.get("type") == "assistant":
-            for block in (ev.get("message") or {}).get("content") or []:
+            msg = _dict(ev.get("message"))
+            if isinstance(msg.get("usage"), dict):
+                usage_by_msg[str(msg.get("id") or f"line{i}")] = msg["usage"]
+            content = msg.get("content")
+            for block in content if isinstance(content, list) else []:
                 if isinstance(block, dict) and block.get("type") == "tool_use":
                     n_tools += 1
-                    rec.transcript({"type": "tool_use", "name": block.get("name"), "input": block.get("input")})
+                    rec.transcript({"type": "tool_use", "name": str(block.get("name"))[:200],
+                                    "input": block.get("input")})
         elif ev.get("type") == "result":
+            # The last one: the CLI emits exactly one, at its very end. A line the agent
+            # forged mid-run (via the CLI's stdout) comes before it.
             result = ev
     if result is None:
-        return AgentOutcome("agent_error", n_commands=n_tools, message="no result event in agent output")
-    usage = result.get("usage") or {}
-    subtype = result.get("subtype", "")
-    status = ("submitted" if subtype == "success" and not result.get("is_error")
-              else "step_limit" if subtype == "error_max_turns" else "agent_error")
+        tin = tout = 0
+        for u in usage_by_msg.values():
+            a, b = _tokens(u)
+            tin, tout = tin + a, tout + b
+        return AgentOutcome("agent_error", input_tokens=tin, output_tokens=tout, n_commands=n_tools,
+                            message="no result event in agent output (tokens summed from assistant events)")
+    tin, tout = _tokens(_dict(result.get("usage")))
+    subtype = str(result.get("subtype") or "")
+    text = str(result.get("result") or subtype)
+    is_error = result.get("is_error") is True
+    if is_error and n_tools == 0 and PROVIDER_ERROR.search(text):
+        status = "model_error"
+    elif subtype == "success" and not is_error:
+        status = "submitted"
+    else:
+        status = "step_limit" if subtype == "error_max_turns" else "agent_error"
     return AgentOutcome(
         exit_status=status,  # type: ignore[arg-type]
-        steps=int(result.get("num_turns") or 0),
-        input_tokens=sum(int(usage.get(k) or 0) for k in
-                         ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")),
-        output_tokens=int(usage.get("output_tokens") or 0),
-        cost_usd=float(result.get("total_cost_usd") or 0.0),
+        steps=safe_num(result.get("num_turns"), int),
+        input_tokens=tin,
+        output_tokens=tout,
+        cost_usd=safe_num(result.get("total_cost_usd"), float),
         n_commands=n_tools,
-        message=str(result.get("result") or subtype)[:2000],
+        message=text[:2000],
     )
 
 

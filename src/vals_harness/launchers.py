@@ -39,6 +39,7 @@ COPY agent/ /agent/
 
 AGENT_CPUS = "1"
 AGENT_MEMORY = "2g"
+AGENT_BUILD_TIMEOUT_S = 1200   # see specs.PREPARE_SLACK_S
 
 
 class AgentSession(Protocol):
@@ -108,7 +109,7 @@ class HostLauncher:
         env = {k: os.environ[k] for k in ("PATH", "HOME", "LANG", "TMPDIR") if k in os.environ}
         env["PYTHONPATH"] = str(SRC_DIR)
         env["PYTHONUNBUFFERED"] = "1"
-        for name in agent.secrets:
+        for name in [*agent.secrets, *agent.optional_secrets]:
             if name in os.environ:
                 env[name] = os.environ[name]
         proc = _start(argv, cwd=agent.root, env=env, stderr_path=stderr_path, name=agent.name)
@@ -126,6 +127,7 @@ class DockerLauncher:
 
     def __init__(self) -> None:
         self._images: dict[str, str] = {}
+        self._ids: dict[str, str] = {}      # agent name -> pinned image id from prepare()
 
     @staticmethod
     def _recipe(agent: AgentSpec) -> bytes:
@@ -154,18 +156,22 @@ class DockerLauncher:
                                 ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".env*"))
                 shutil.copytree(SDK_DIR, Path(ctx) / "vals_agent_sdk", ignore=shutil.ignore_patterns("__pycache__"))
                 (Path(ctx) / "Dockerfile").write_bytes(recipe)
-                _docker(["build", "-q", "-t", tag, ctx], timeout=1200, kind="image")
+                _docker(["build", "-q", "-t", tag, ctx], timeout=AGENT_BUILD_TIMEOUT_S, kind="image")
         self._images[agent.name] = tag
         return tag
 
     def prepare(self, agent: AgentSpec) -> str | None:
         tag = self.image_for(agent)
-        return _docker(["image", "inspect", "--format", "{{.Id}}", tag]).stdout.decode().strip()
+        image_id = _docker(["image", "inspect", "--format", "{{.Id}}", tag], kind="image").stdout.decode().strip()
+        self._ids[agent.name] = image_id
+        return image_id
 
     def launch(self, agent: AgentSpec, stderr_path: Path, labels: dict[str, str]) -> AgentSession:
-        image = self.image_for(agent)
+        # The pinned id from prepare(), never the tag: a tag can move, and a missing one
+        # would make `docker run` pull `vals/agent-...` from a registry (`--pull never`).
+        image = self._ids.get(agent.name) or self.prepare(agent)
         name = f"vals-agent-{labels.get('vals.claim', os.urandom(6).hex())[:12]}"
-        argv = ["docker", "run", "-i", "--rm", "--name", name, "--label", "vals.managed=1",
+        argv = ["docker", "run", "-i", "--rm", "--pull", "never", "--name", name, "--label", "vals.managed=1",
                 "--label", "vals.role=agent"]
         for k, v in labels.items():
             argv += ["--label", f"{k}={v}"]
@@ -173,7 +179,7 @@ class DockerLauncher:
         # `-e NAME` (no value) makes docker read the value from its own environment, so
         # secrets never appear in this command line (or in `ps`).
         env = dict(os.environ)
-        for secret in agent.secrets:
+        for secret in [*agent.secrets, *agent.optional_secrets]:
             if secret in os.environ:
                 argv += ["-e", secret]
         argv += ["-w", "/agent", image, *agent.command]

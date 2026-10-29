@@ -4,7 +4,10 @@ import textwrap
 import time
 from pathlib import Path
 
+import pytest
+
 from vals_harness.chamber_api import ChamberApi
+from vals_harness.errors import ChamberStopped, InfraError
 from vals_harness.launchers import HostLauncher
 from vals_harness.sandbox import ExecResult
 from vals_harness.specs import AgentSpec
@@ -22,6 +25,8 @@ class FakeSandbox:
         return True
 
     def exec(self, cmd, *, timeout, cwd="/workspace", env=None, stdin=None):
+        if cmd == "kill 1":
+            raise ChamberStopped("sandbox stopped from the inside during exec (init exited with 143)")
         self.cmds.append(cmd)
         out = "x" * self.output_bytes if self.output_bytes else f"ran:{cmd}"
         return ExecResult(output=out, returncode=0, timed_out=False, truncated=False, duration_s=0.0)
@@ -51,7 +56,7 @@ class ListRecorder:
 
 def _serve(tmp_path: Path, body: str, timeout_s: float = 20, output_bytes: int = 0):
     folder = tmp_path / "agent"
-    folder.mkdir()
+    folder.mkdir(parents=True)
     (folder / "agent.py").write_text("from vals_agent_sdk.client import AgentClient\n" + textwrap.dedent(body))
     spec = AgentSpec(name="t", placement="host", command=["python", "agent.py"], root=folder)
     sb, rec = FakeSandbox(output_bytes), ListRecorder()
@@ -156,3 +161,67 @@ def test_agent_that_stops_reading_cannot_block_the_worker(tmp_path, monkeypatch)
     """, timeout_s=1, output_bytes=200_000)
     assert outcome.exit_status == "timeout"
     assert time.monotonic() - t0 < 20
+
+
+def test_agent_stopping_its_chamber_ends_the_session_as_agent_error(tmp_path):
+    t0 = time.monotonic()
+    outcome, sb, rec = _serve(tmp_path, """
+        from vals_agent_sdk.client import ChamberError
+        c = AgentClient("t", "1")
+        codes = []
+        for cmd in ("kill 1", "echo after"):
+            try:
+                c.exec(cmd)
+            except ChamberError as e:
+                codes.append(e.code)
+        c.finish("submitted", cost_usd=0.4, input_tokens=9, message=",".join(map(str, codes)))
+    """)
+    assert outcome.exit_status == "agent_error" and "stopped its chamber" in outcome.message
+    assert (outcome.cost_usd, outcome.input_tokens) == (0.4, 9)   # reported spend is kept
+    assert sb.cmds == []                                            # nothing ran after the stop
+    assert any(t == "chamber_stopped" for t, _ in rec.events)
+    assert time.monotonic() - t0 < 10
+
+
+def test_finish_during_the_cancel_grace_keeps_reported_spend(tmp_path):
+    outcome, _, _ = _serve(tmp_path, """
+        import time
+        c = AgentClient("t", "1")
+        while not c.cancelled:
+            try:
+                c.exec("work")
+            except Exception:
+                break
+            time.sleep(0.05)
+        c.finish("submitted", steps=7, cost_usd=1.25, input_tokens=1000, output_tokens=50)
+    """, timeout_s=1)
+    assert outcome.exit_status == "timeout"
+    assert (outcome.steps, outcome.cost_usd, outcome.input_tokens, outcome.output_tokens) == (7, 1.25, 1000, 50)
+
+
+def test_model_error_is_honoured_only_before_any_chamber_command(tmp_path):
+    before, _, _ = _serve(tmp_path / "a", """
+        c = AgentClient("t", "1")
+        c.finish("model_error", message="AuthenticationError: invalid x-api-key")
+    """)
+    assert before.exit_status == "model_error"
+    after, _, _ = _serve(tmp_path / "b", """
+        c = AgentClient("t", "1")
+        c.exec("ls")
+        c.finish("model_error", message="AuthenticationError")
+    """)
+    assert after.exit_status == "agent_error" and "after 1 command" in after.message
+
+
+@pytest.mark.parametrize("rc,infra", [(125, True), (126, True), (127, True), (1, False)])
+def test_launch_failure_before_hello_is_infra(tmp_path, rc, infra):
+    """`docker run` failing (125-127: daemon error, name conflict, missing command) is the
+    harness's; any other exit before hello stays the agent's (it never saw the task)."""
+    spec = AgentSpec(name="t", placement="host", command=["sh", "-c", f"exit {rc}"], root=tmp_path)
+    session = HostLauncher().launch(spec, tmp_path / "stderr.log", {})
+    api = ChamberApi(FakeSandbox(), ListRecorder(), trial_id="t", command_timeout_s=30)
+    if infra:
+        with pytest.raises(InfraError, match=f"docker exit {rc}"):
+            api.serve(session, {"instruction": "x"}, deadline=time.monotonic() + 20)
+    else:
+        assert api.serve(session, {"instruction": "x"}, deadline=time.monotonic() + 20).exit_status == "agent_error"
