@@ -35,6 +35,7 @@ Status: draft for discussion. **(proposed)** marks decisions still open to chang
 | Stuck agents | recv deadline + watchdog that kills the agent process | recv deadline only | An agent that stops reading blocked the worker's write forever |
 | Claude Code as root | `--allowedTools` pre-approval | `--dangerously-skip-permissions` as non-root user | Claude Code refuses skip-permissions as root; switching user would change the task environment (many tasks need root) |
 | Installed runtime | Image layer FROM pinned task image | `npm install` inside a live chamber | Cached, reproducible (pinned id), no slow install inside a running trial |
+| Claude Code without polluting the chamber | Phantom box: mirror (same base + shared /workspace,/tmp) + phantom shell | ACP client; MCP tool swap; FUSE mirror; shared namespaces | Stock Claude Code, chamber offline and secret-free. ACP's delegation coverage is unverified; an MCP swap measures a different agent; FUSE/namespaces need CAP_SYS_ADMIN in the box |
 | Benchmark scripts | Run in a tooling container | Run on the host | `prepare.py` installs packages; host stays clean |
 | Shell choice (`sh` vs `bash`) | The `Sandbox` | Each agent adapter | It's a property of the image; solved once for all agents |
 | Job unit | Trial | Run | Parallelism, per-trial retry, partial results early |
@@ -76,7 +77,7 @@ Nobody standard runs Claude Code as a sidecar. The pros accept a modified task i
 | Task | One problem: instruction, task image, eval files, grading command. |
 | Agent | Model + scaffold. Placement: **sidecar** (own agent container, reaches the chamber via the Chamber API; default), **installed** (inside the chamber), or **host** (agent runner as a host subprocess, same protocol; dev only). |
 | Chamber API | The worker-side service that exposes `Sandbox` (exec / put / get) to an agent container over that container's stdin/stdout. The only path from an agent container into a chamber. |
-| Bridge | How a sidecar agent's actions reach the Chamber API: **api** (agent calls it natively, e.g. mini-swe-agent) or **shell_relay** (agent's hardwired shell is pointed at a relay binary, e.g. Claude Code). |
+| Bridge | How a sidecar agent's actions reach the Chamber API: **api** (agent calls it natively, e.g. mini-swe-agent) or **phantom shell** (agent's hardwired shell is pointed at a relay binary, e.g. Claude Code). |
 | Run | One `harness run`: agent × benchmark × tasks × attempts × config. |
 | Trial | One attempt at one task. The unit of work, retry and grading. |
 | Chamber | The container where the agent acts: task image + agent-visible workspace (+ agent runtime if installed). |
@@ -174,7 +175,7 @@ Every sidecar agent runs in its own container. The only way into the chamber is 
 - Scoped to one trial by construction: each pipe pair belongs to one container.
 - The runner reserves the real stdout for RPC at startup and redirects `sys.stdout` to stderr, so a stray `print` can't corrupt the channel.
 - Requests are handled one at a time per trial (agents act sequentially).
-- `shell_relay` (stretch): the relay binary runs inside the agent container, so it connects to the in-container runner over a local unix socket, and the runner forwards over stdio. That socket never crosses the Docker VM boundary.
+- **Phantom shell** (§5.5): the phantom box's `/bin/sh` and `/bin/bash` connect to the in-box runner over a local unix socket, and the runner forwards over stdio. That socket never crosses the Docker VM boundary.
 
 | Method | Params | Result |
 |---|---|---|
@@ -194,7 +195,7 @@ Every sidecar agent runs in its own container. The only way into the chamber is 
 
 **Bridges**
 - **api** (v1, mini-swe-agent): the agent image ships `ChamberEnvironment`, a ~40-line implementation of mini's environment interface (`execute(action)`) that calls the Chamber API. Mini's loop, prompts and tools are unchanged. The shell (`sh -c` vs `bash -lc`) is applied by the worker's `Sandbox`, not by mini. **Gotcha:** mini detects "task done" inside its environment class: output whose first line is `COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT` raises `Submitted`. `ChamberEnvironment` must keep that check, or mini runs to its step limit.
-- **shell_relay** (stretch, Claude Code): Claude Code's Bash tool is pointed at a static Rust relay binary that forwards to the Chamber API. Read/Edit act on shared `/workspace` and `/tmp`. The sidecar image is built `FROM` the task image so Read and Bash see the same world. Runs `--read-only`, agent as non-root, relay root-owned (the agent's file tools can reach it). Precondition: a spike logging exactly what Claude Code sends to its shell.
+- **phantom** (Claude Code): see §5.5.
 
 **Costs:** one extra container per trial; a socket hop per action (negligible next to model latency); the agent image must be built per agent version.
 
@@ -264,6 +265,30 @@ A remote agent is split into a **brain** (model + loop, on the vendor's side) an
 
 - **Latency:** each action crosses the internet (~50–200 ms), still small next to model calls.
 - **Trust runs both ways.** The vendor protects its agent; Vals protects its benchmarks. Task content is already visible to the model provider in any API-based eval, so remote mode adds no new kind of exposure. What changes: possibly an extra party (an agent vendor that isn't the model provider), possibly weaker data terms than the provider's API agreement, and tasks arriving pre-packaged with full trajectories. Tests and graders never leave our verifier in any mode. `policy.allow_remote_agents` per benchmark records whether a given vendor may see that benchmark under its terms.
+
+### 5.5 Phantom box (`placement: phantom`)
+
+Stock Claude Code in its own container that mirrors the chamber, so the chamber can stay the bare task image, offline, with no secrets.
+
+```
+ phantom box (FROM task image + Claude Code layer + phantom)      worker              chamber (task image, untouched, --network none)
+ ┌───────────────────────────────────────────────┐   stdio    ┌─────────────┐ docker ┌──────────────────────────┐
+ │ phantom run ── claude -p … (instruction stdin) │ ─JSON-RPC▶ │ Chamber API │ ─exec─▶│ eval '<cmd>' && pwd -P … │
+ │   ▲ unix socket          Read/Edit/Glob/Grep   │            └─────────────┘        │                          │
+ │ /bin/sh, /bin/bash = phantom shell ─┘   │      │                                    │                          │
+ └─────────────────────────────────────────┼──────┘                                    └────────────┬─────────────┘
+                                           └──── shared per-trial volumes: /workspace, /tmp ─────────┘
+```
+
+- **One Rust binary** (`phantom/`, static musl, ~0.5 MB), two roles. As `phantom run` it is the box's main process: it speaks vals-agent/1 over stdio, starts the CLI with the instruction on stdin, serves phantom shells on a unix socket, then sends the CLI's stream-json as an artifact and `finish`. As `sh`/`bash` it relays the command to the runner; output and exit code come back.
+- **What Claude Code sends its shell** (from a spike that logged every invocation): startup probes (`uname`, `env`), a shell snapshot (`bash -c -l "SNAPSHOT_FILE=… <bash-only script>"`), and per tool call `bash -c "source <snapshot> … && eval '<CMD>' < /dev/null && pwd -P >| /tmp/claude-XXXX-cwd"` started in the tracked cwd. So:
+  - the snapshot runs **locally** with the real bash (it describes the box's shell, not the task);
+  - tool calls are forwarded as the **POSIX tail** `eval '<CMD>' … && pwd -P >| <file>`, so they run in chambers without bash (alpine) and the cwd tracking still works through the shared `/tmp`;
+  - probes and `env` run in the chamber, so the agent sees the chamber's OS and environment.
+- **The phantom shell never forwards its environment**, so the API key stays in the box. Runner output and Claude's config live in box-only paths (`/var/lib/phantom/…`), not the shared `/tmp`, so the chamber can't rewrite them.
+- **Image**: task image → Claude Code install layer (shared with `claude-code`) → phantom layer (Rust build stage + shells replaced), pinned by id, run with `--pull never`.
+- **Mirror limits (v1)**: the box's filesystem outside `/workspace` and `/tmp` is its own copy of the task image; writes the chamber makes elsewhere (e.g. `pip install`) aren't visible to Read/Grep. v2: FUSE over the Chamber API with prefetching (needs `/dev/fuse` + `CAP_SYS_ADMIN` in the box, which is why it isn't v1). Long-running/background shell commands block until done (the Chamber API is request/response).
+- **Observed** (Opus 5.5): same scores as the installed variant, bash 5/5, python 2/3. A $0 fake-CLI test proves the box has the secret, the chamber doesn't, the chamber is offline, exit codes and files round-trip, and every relayed command is in the transcript.
 
 ## 6. Specs: who owns what
 
@@ -479,7 +504,8 @@ harness cancel --run_id ID
 2. ✅ `DockerLauncher`: every agent runs in its own sidecar container (`docker run -i`, same stdio protocol). Agent images are built in PREPARE from the agent folder + SDK (default Dockerfile, or the agent's own), tagged by content hash, and pinned by id in the manifest. Secrets passed as `-e NAME` (never on the command line); the container has no mounts, egress for model calls, the standard hardening, and is removed by name on kill.
 3. ✅ Worker supervisor: N slots, one child process per trial, trial wall clock, clean release on shutdown; `harness prune`.
 4. ✅ Claude Code, installed (Harbor pattern): runtime layer FROM the pinned task image, headless stream-json, logs and transcript collected; a fake-CLI test covers the path at $0.
-5. Stretch: Claude Code via `shell_relay` (spike first), model proxy, network lockdown.
+5. ✅ Phantom box: stock Claude Code in its own container, shell relayed into the chamber (§5.5).
+6. Next: model proxy (dummy keys, uniform model transcript), FUSE mirror with prefetch for the phantom box, remote agents.
 
 ## 12. Timeouts
 
@@ -506,9 +532,10 @@ They run as sidecar containers like any other agent; a further integration test 
 ```
 vals-harness/
 ├── src/vals_harness/       cli.py · service.py · specs.py · sandbox/ (Sandbox, docker.py) · benchmarks.py · protocol.py
-│                           launchers.py · chamber_api.py · installed.py · trial.py · trial_child.py · store.py · results.py · errors.py
+│                           launchers.py · chamber_api.py · installed.py · phantom.py · trial.py · trial_child.py · store.py · results.py · errors.py
 ├── src/vals_agent_sdk/     client.py (agent side of vals-agent/1, stdlib only)
-├── agents/                 mini-swe-agent/ · claude-code/ · oracle/ · noop/ · cheater/ · vandal/
+├── phantom/                Rust: phantom runner + phantom shell
+├── agents/                 mini-swe-agent/ · claude-code/ · claude-code-phantom/ · oracle/ · noop/ · cheater/ · vandal/
 ├── benchmarks/             bash-operations/ · python-tasks/   (starter files untouched + harness.yaml)
 ├── docker/                 tooling images
 ├── tests/

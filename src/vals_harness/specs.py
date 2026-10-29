@@ -130,18 +130,18 @@ class InstalledRuntime(Frozen):
 class AgentSpec(Frozen):
     name: str
     version: str = "0"
-    placement: Literal["host", "sidecar", "installed"]
+    placement: Literal["host", "sidecar", "installed", "phantom"]
     command: list[str] = []                 # how to start the agent runner (host/sidecar)
-    installed: InstalledRuntime | None = None   # placement: installed
+    installed: InstalledRuntime | None = None   # placement: installed / phantom
     secrets: list[str] = []                 # env var names forwarded to the agent only
     defaults: dict[str, Any] = {}           # model + limit defaults
     root: Path                              # set by the loader: the agent folder
 
     @model_validator(mode="after")
     def _placement_fields(self) -> AgentSpec:
-        if self.placement == "installed" and self.installed is None:
-            raise ValueError("placement: installed needs an `installed:` section")
-        if self.placement != "installed" and not self.command:
+        if self.placement in ("installed", "phantom") and self.installed is None:
+            raise ValueError(f"placement: {self.placement} needs an `installed:` section")
+        if self.placement in ("host", "sidecar") and not self.command:
             raise ValueError(f"placement: {self.placement} needs a `command`")
         return self
 

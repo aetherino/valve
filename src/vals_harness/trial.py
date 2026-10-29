@@ -19,6 +19,9 @@ from vals_harness.benchmarks import BenchmarkAdapter
 from vals_harness.chamber_api import AgentOutcome, ChamberApi
 from vals_harness.errors import InfraError
 from vals_harness.installed import InstalledRunner
+from vals_harness.phantom import PhantomLauncher
+from vals_harness.phantom import create_volumes as phantom_volumes
+from vals_harness.phantom import remove_volumes as remove_phantom_volumes
 from vals_harness.launchers import AgentLauncher, DockerLauncher, HostLauncher
 from vals_harness.sandbox import SandboxProvider
 from vals_harness.specs import TrialSpec
@@ -61,6 +64,7 @@ class TrialRunner:
         self.artifacts_root = artifacts_root
         self.launchers = launchers or {"host": HostLauncher(), "sidecar": DockerLauncher()}
         self.installed = InstalledRunner()
+        self.phantom = PhantomLauncher()
 
     def run(self, claim: Claim) -> dict[str, Any]:
         """Run one try. Raises LostLease if another worker took the trial over."""
@@ -78,22 +82,22 @@ class TrialRunner:
             # 1 PREPARE
             self._phase(claim, rec, "preparing")
             bench = BenchmarkAdapter(spec.benchmark, self.provider)
-            installed = spec.agent.placement == "installed"
-            launcher = None if installed else self.launchers.get(spec.agent.placement)
-            if not installed and launcher is None:
-                raise InfraError("adapter", f"placement {spec.agent.placement!r} is not available")
+            placement = spec.agent.placement
+            launcher = self.launchers.get(placement) if placement in ("host", "sidecar") else None
+            if placement in ("host", "sidecar") and launcher is None:
+                raise InfraError("adapter", f"placement {placement!r} is not available")
             # Images (task, tooling, agent) are resolved before any container starts,
             # so a slow build never holds a chamber open, and all of them get pinned.
             pins = {"task_image": self.provider.ensure_image(spec.task.image),
                     "tooling_image": bench.tooling_image()}
-            if installed:
-                # The chamber itself is task image + agent runtime (recorded, never installed live).
-                pins["agent_image"] = self.installed.prepare(spec.agent, pins["task_image"])
-                chamber_image = pins["agent_image"]
-            else:
-                if agent_image := launcher.prepare(spec.agent):  # type: ignore[union-attr]
-                    pins["agent_image"] = agent_image
-                chamber_image = pins["task_image"]
+            chamber_image = pins["task_image"]
+            if placement == "installed":
+                # The chamber itself is task image + agent runtime (a prebuilt layer, never installed live).
+                pins["agent_image"] = chamber_image = self.installed.prepare(spec.agent, pins["task_image"])
+            elif placement == "phantom":
+                pins["agent_image"] = self.phantom.prepare(spec.agent, pins["task_image"])
+            elif agent_image := launcher.prepare(spec.agent):  # type: ignore[union-attr]
+                pins["agent_image"] = agent_image
             self._write_manifest(spec, pins, folder)
             prepared = bench.prepare(spec.task, folder / "work", labels)
 
@@ -103,18 +107,24 @@ class TrialRunner:
             deadline = time.monotonic() + spec.limits.timeout_s
             # An installed agent calls its model from inside the chamber, so that chamber
             # needs egress (v2: model proxy only). Everything else stays offline.
-            network = "egress" if installed else spec.policy.network
+            network = "egress" if placement == "installed" else spec.policy.network
+            # Phantom box and chamber share /workspace and /tmp (per-trial volumes).
+            volumes = phantom_volumes(claim.token, labels) if placement == "phantom" else None
             # Created from a pinned image id, so a tag can't move under a running trial.
             with self.provider.create(chamber_image, labels={**labels, "vals.role": "chamber"},
                                       network=network, cpus=spec.limits.cpus,
-                                      memory=spec.limits.memory) as chamber:
+                                      memory=spec.limits.memory, volumes=volumes) as chamber:
                 chamber.put_dir(prepared.visible_dir, WORKSPACE)
                 if spec.policy.expose_eval_files and any(prepared.eval_dir.iterdir()):
                     chamber.put_dir(prepared.eval_dir, WORKSPACE)
-                if installed:
+                if placement == "installed":
                     outcome = self.installed.run(spec, chamber, rec, deadline)
                 else:
-                    session = launcher.launch(spec.agent, folder / "agent_stderr.log", labels)  # type: ignore[union-attr]
+                    if placement == "phantom":
+                        session = self.phantom.launch(spec.agent, pins["agent_image"], folder / "agent_stderr.log",
+                                                      labels, volumes or {})
+                    else:
+                        session = launcher.launch(spec.agent, folder / "agent_stderr.log", labels)  # type: ignore[union-attr]
                     api = ChamberApi(chamber, rec, trial_id=spec.trial_id,
                                      command_timeout_s=spec.limits.command_timeout_s)
                     outcome = api.serve(session, self._start_payload(spec), deadline=deadline)
@@ -138,6 +148,8 @@ class TrialRunner:
             result = {"status": "infra_error", "error": {"kind": "adapter", "message": f"{type(e).__name__}: {e}"}}
         finally:
             self.provider.reap({"vals.claim": claim.token})
+            if spec.agent.placement == "phantom":
+                remove_phantom_volumes(claim.token)
             rec.close()
 
         # 6 RECORD

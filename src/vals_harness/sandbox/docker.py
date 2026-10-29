@@ -234,10 +234,12 @@ class DockerSandboxProvider:
         return tag
 
     def create(self, image: str, *, labels: dict[str, str], network: str = "none",
-               cpus: float = 1.0, memory: str = "1g") -> DockerSandbox:
+               cpus: float = 1.0, memory: str = "1g", volumes: dict[str, str] | None = None) -> DockerSandbox:
         args = ["run", "-d", "--label", "vals.managed=1"]
         for k, v in labels.items():
             args += ["--label", f"{k}={v}"]
+        for vol, path in (volumes or {}).items():   # phantom placement: /workspace + /tmp shared with the box
+            args += ["-v", f"{vol}:{path}"]
         args += [
             *HARDENING,
             "--network", "none" if network == "none" else "bridge",

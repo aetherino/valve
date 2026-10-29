@@ -1,0 +1,15 @@
+[package]
+name = "phantom"
+version = "0.1.0"
+edition = "2021"
+description = "Phantom box: runs an agent CLI next to the chamber and relays its shell into the chamber"
+
+[dependencies]
+serde_json = "1"
+base64 = "0.22"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"

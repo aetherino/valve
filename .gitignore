@@ -12,3 +12,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 *.egg-info/
+# rust build output
+phantom/target/
+# Claude Code local state (worktrees etc.)
+.claude/

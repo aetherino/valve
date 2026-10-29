@@ -1,0 +1,25 @@
+# Claude Code in a phantom box: stock Claude Code in its own container that mirrors
+# the chamber (same base image, shared /workspace and /tmp); its shell is the phantom
+# shell, which runs every command in the chamber via the Chamber API. Unlike
+# `claude-code` (installed), the chamber stays the bare task image, offline, no secrets.
+name: claude-code-phantom
+version: "2.1.312"
+placement: phantom
+installed:
+  dockerfile: ../claude-code/install.Dockerfile   # same runtime layer as the installed variant
+  run: >-
+    claude -p --output-format stream-json --verbose
+    --model {model} --max-turns {max_turns}
+    --allowedTools "Bash Read Write Edit Glob Grep"
+  env:
+    CLAUDE_CONFIG_DIR: /var/lib/phantom/claude    # box-only (not the shared /tmp)
+    USE_BUILTIN_RIPGREP: "0"
+    DISABLE_AUTOUPDATER: "1"
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+    ANTHROPIC_CUSTOM_HEADERS: "anthropic-workspace-id: ${ANTHROPIC_WORKSPACE_ID}"   # only if set
+  output_parser: claude_stream_json   # parsed by the phantom runner, which reports `finish`
+secrets: [ANTHROPIC_API_KEY]
+defaults:
+  model: claude-opus-5-5
+  step_limit: 50
+  command_timeout_s: 600   # Claude's Bash tool allows up to 10 min per command
