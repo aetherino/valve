@@ -33,9 +33,11 @@ def cli() -> None:
 @click.option("--expose-eval-files", is_flag=True, help="Let the agent see the tests (default: hidden)")
 @click.option("--wait", is_flag=True, help="Run the trials now (in-process worker) and print results")
 @click.option("--slots", default=1, show_default=True, help="With --wait: trials run concurrently")
+@click.option("--follow", is_flag=True, help="With --wait: print every chamber command as it happens")
 @root_option
 def run(agent: str, benchmark: str, task_ids: str | None, model: str | None, attempts: int,
-        limits: tuple[str, ...], expose_eval_files: bool, wait: bool, slots: int, root: Path) -> None:
+        limits: tuple[str, ...], expose_eval_files: bool, wait: bool, slots: int, follow: bool,
+        root: Path) -> None:
     """Run an agent against a benchmark."""
     paths = service.Paths.from_root(root)
     spec = RunSpec(
@@ -56,7 +58,7 @@ def run(agent: str, benchmark: str, task_ids: str | None, model: str | None, att
     def show(result: dict[str, Any], status: str | None) -> None:
         click.echo("  " + _trial_line(result, status))
 
-    service.work(paths, slots=slots, run_id=run_id, on_result=show)
+    service.work(paths, slots=slots, run_id=run_id, on_result=show, on_event=_show_event if follow else None)
     _print_summary(results_mod.summarize(Store(paths.db), run_id))
 
 
@@ -106,12 +108,13 @@ def results(run_id: str, fmt: str, root: Path) -> None:
 @cli.command()
 @click.option("--slots", default=1, show_default=True, help="Trials run concurrently (one child process each)")
 @click.option("--once", is_flag=True, help="Exit when the queue is empty instead of waiting for work")
+@click.option("--follow", is_flag=True, help="Print every chamber command as it happens")
 @root_option
-def worker(slots: int, once: bool, root: Path) -> None:
+def worker(slots: int, once: bool, follow: bool, root: Path) -> None:
     """Start a worker that executes queued trials."""
     paths = service.Paths.from_root(root)
     click.echo(f"worker started with {slots} slot(s)" + (" (exits when queue is empty)" if once else "; Ctrl-C to stop"))
-    service.work(paths, slots=slots, stop_when_empty=once,
+    service.work(paths, slots=slots, stop_when_empty=once, on_event=_show_event if follow else None,
                  on_result=lambda r, st: click.echo("  " + r["run_id"] + "  " + _trial_line(r, st)))
 
 
@@ -140,6 +143,21 @@ def prune(dry_run: bool, root: Path) -> None:
 
 
 # ---------------------------------------------------------------------- helpers
+
+
+def _show_event(ev: Any) -> None:
+    p = json.loads(ev["payload_json"])
+    tag = f"[{ev['task_id']} a{ev['attempt']}]"
+    if ev["type"] == "exec":
+        mark = "⏱" if p.get("timed_out") else ("✓" if p.get("returncode") == 0 else f"rc={p.get('returncode')}")
+        cmd = " ".join(str(p.get("cmd", "")).split())
+        click.echo(f"  {tag:<14} $ {cmd[:110]}  {mark}")
+    elif ev["type"] == "phase":
+        click.echo(f"  {tag:<14} ── {p.get('status')}")
+    elif ev["type"] == "agent_finished":
+        click.echo(f"  {tag:<14} ── agent: {p.get('exit_status')}  steps={p.get('steps')}  ${p.get('cost_usd', 0):.4f}")
+    elif ev["type"] == "infra_error":
+        click.echo(f"  {tag:<14} ── infra_error [{p.get('kind')}] {str(p.get('message'))[:80]}")
 
 
 def _parse_limits(pairs: tuple[str, ...]) -> dict[str, Any]:

@@ -104,3 +104,13 @@ def test_release_returns_a_trial_without_charging_it(store, root):
     row = store.db.execute("SELECT infra_attempts FROM trials WHERE id=?", (c.spec.trial_id,)).fetchone()
     assert row[0] == 0
     assert not store.release(c.spec.trial_id, c.token)   # the old token is dead
+
+
+def test_global_cap_limits_active_trials_across_workers(store, root):
+    _enqueue(store, root, attempts=2)                      # 6 trials
+    a = [store.claim("worker-a", 60, max_active=3) for _ in range(2)]
+    b = [store.claim("worker-b", 60, max_active=3) for _ in range(2)]
+    assert all(a) and b[0] is not None and b[1] is None    # the 4th claim is refused: 3 active
+    assert store.queued_count() == 3
+    store.finish(a[0].spec.trial_id, a[0].token, _graded(True))
+    assert store.claim("worker-b", 60, max_active=3) is not None   # a slot freed up

@@ -22,6 +22,7 @@ from vals_harness.specs import (AgentSpec, BenchmarkSpec, RunSpec, TrialSpec, lo
 from vals_harness.store import ACTIVE, Claim, Store
 
 LEASE_S = 60
+FOLLOW_EVENTS = ("phase", "exec", "agent_finished", "infra_error")
 HEARTBEAT_S = 10
 
 
@@ -98,8 +99,16 @@ class _Running:
     deadline: float              # monotonic; trial wall clock
 
 
+def max_active_trials() -> int | None:
+    """VALS_MAX_ACTIVE_TRIALS: global cap on running trials for this home (all workers).
+    Each trial runs at most 3 containers at once, so this also bounds live containers."""
+    v = os.environ.get("VALS_MAX_ACTIVE_TRIALS")
+    return int(v) if v else None
+
+
 def work(paths: Paths, *, slots: int = 1, run_id: str | None = None, stop_when_empty: bool = True,
-         on_result: Callable[[dict[str, Any], str | None], None] | None = None) -> None:
+         on_result: Callable[[dict[str, Any], str | None], None] | None = None,
+         on_event: Callable[[Any], None] | None = None) -> None:
     """Worker supervisor: keeps up to `slots` trials running, each in its own child process.
 
     The supervisor is the only writer of final results. It renews every running
@@ -120,6 +129,9 @@ def work(paths: Paths, *, slots: int = 1, run_id: str | None = None, stop_when_e
     provider.reap_stale(store.live_claims(), store.home_id)  # leftovers from this home's dead workers
     running: dict[str, _Running] = {}
     last_heartbeat = time.monotonic()
+    cap = max_active_trials()
+    last_event = store.max_event_id()
+    mine: set[str] = set()   # trials this worker claimed (their last events can arrive after they finish)
     restore = _shutdown_on_signals()
 
     def record(r: _Running, result: dict[str, Any] | None) -> None:
@@ -148,19 +160,28 @@ def work(paths: Paths, *, slots: int = 1, run_id: str | None = None, stop_when_e
                 elif not result.get("lost_lease"):
                     record(r, result)
 
-            # 2. fill free slots
+            # 2. fill free slots (bounded by the global cap, if set)
             claimed_any = False
             while len(running) < slots:
-                claim = store.claim(worker_id, LEASE_S, run_id=run_id)
+                claim = store.claim(worker_id, LEASE_S, run_id=run_id, max_active=cap)
                 if claim is None:
                     break
                 claimed_any = True
+                mine.add(claim.spec.trial_id)
                 running[claim.token] = _spawn(paths, jobs_dir, claim)
 
+            # live progress (e.g. `run --follow`): new events from trials this worker ran
+            if on_event:
+                for ev in store.events_after(last_event, FOLLOW_EVENTS):
+                    last_event = ev["id"]
+                    if ev["trial_id"] in mine:
+                        on_event(ev)
+
             if not running and not claimed_any:
-                if stop_when_empty:
+                # Nothing here; others may still hold the cap or be finishing trials.
+                if stop_when_empty and store.queued_count(run_id) == 0:
                     return
-                time.sleep(2)
+                time.sleep(1)
                 continue
 
             # 3. renew leases; a lease we lost means another worker owns the trial now

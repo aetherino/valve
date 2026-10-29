@@ -308,6 +308,7 @@ Stock Claude Code in its own container that mirrors the chamber, so the chamber 
 - **The phantom shell never forwards its environment**, so the API key stays in the box. Runner output and Claude's config live in box-only paths (`/var/lib/phantom/…`), not the shared `/tmp`, so the chamber can't rewrite them.
 - **Image**: task image → Claude Code install layer (shared with `claude-code`) → phantom layer (Rust build stage + shells replaced), pinned by id, run with `--pull never`.
 - **Mirror limits (v1)**: the box's filesystem outside `/workspace` and `/tmp` is its own copy of the task image; writes the chamber makes elsewhere (e.g. `pip install`) aren't visible to Read/Grep. v2: FUSE over the Chamber API with prefetching (needs `/dev/fuse` + `CAP_SYS_ADMIN` in the box, which is why it isn't v1). Long-running/background shell commands block until done (the Chamber API is request/response).
+- **Shell dialect gap**: the box has bash (Claude Code needs it), so Claude assumes bash, but an alpine chamber only has `sh`. Seen live: `touch file{1,2,3}.txt` created one literal file, and a bash array failed with rc=2; Claude noticed and adapted. That is faithful to the task image (it has no bash), but it's a difference from installed mode, where the install layer adds bash to the chamber.
 - **Observed** (Opus 5.5): same scores as the installed variant, bash 5/5, python 2/3. A $0 fake-CLI test proves the box has the secret, the chamber doesn't, the chamber is offline, exit codes and files round-trip, and every relayed command is in the transcript.
 
 ## 6. Specs: who owns what
@@ -432,6 +433,8 @@ harness worker --slots 4                      (supervisor; the only writer of fi
 - **Fencing tokens.** Every claim gets a fresh `claim_token`; every later write (`set_status`, `heartbeat`, `finish`) must present it. A worker that stalled past its lease is fenced out: its writes fail (`LostLease`), its result is dropped, and because containers and artifact folders are per claim (`vals.claim` label, `try<N>/` folder) it can't delete or overwrite the new owner's.
 - **Startup reaper.** A worker removes containers of *its own home* (`vals.home` = hash of the DB path) whose claim isn't live (`reap_stale`). Another `VALS_HOME` (a second checkout, a test run) never touches them.
 - **The worker loop never dies on a trial.** Any exception becomes that trial's `infra_error`; cleanup (`reap`) never raises.
+- **Global cap** `VALS_MAX_ACTIVE_TRIALS`: trials running under live leases across all workers of a home, checked inside the claim transaction. A trial runs at most 3 containers at once (tooling/verifier, chamber, agent box), so this bounds live containers. Measured: 2 workers × 2 slots with a cap of 3 → peak 3 active trials, 6 live containers; 16 mixed trials (mini-swe-agent sidecar + Claude Code phantom) in 67 s.
+- **`--follow`** (`run --wait --follow`, `worker --follow`) prints each chamber command and phase as it happens.
 - **Optional:** a per-model concurrency cap to stay under provider rate limits.
 
 `harness run --wait` runs an in-process worker for the run's trials — convenient for development, same code path.

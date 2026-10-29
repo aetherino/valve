@@ -117,16 +117,25 @@ class Store:
                   t.manifest_hash(), now) for t in trials],
             )
 
-    def claim(self, worker_id: str, lease_s: float, run_id: str | None = None) -> Claim | None:
+    def claim(self, worker_id: str, lease_s: float, run_id: str | None = None,
+              max_active: int | None = None) -> Claim | None:
         """Atomically take the next trial: oldest queued, or an active one whose lease expired.
 
         A reclaimed trial (its worker died) counts as one infra attempt; once those run
         out it is closed as infra_error instead of being handed out again, so a trial
         that keeps killing workers can't loop forever.
+
+        `max_active` caps trials running under live leases across *all* workers of this
+        home (checked inside the same write transaction, so the cap can't be overshot).
         """
         with self._tx():
             while True:
                 now = time.time()
+                if max_active is not None:
+                    active = self.db.execute(f"SELECT COUNT(*) FROM trials WHERE status IN {ACTIVE}"
+                                             f" AND lease_until >= ?", (now,)).fetchone()[0]
+                    if active >= max_active:
+                        return None
                 row = self.db.execute(
                     f"SELECT id, status, infra_attempts, max_infra, tries FROM trials"
                     f" WHERE (status = 'queued' OR (status IN {ACTIVE} AND lease_until < ?))"
@@ -203,6 +212,19 @@ class Store:
             for tid in ids:
                 self._write_result(tid, "cancelled", {"status": "cancelled"})
         return len(ids)
+
+    def queued_count(self, run_id: str | None = None) -> int:
+        return self.db.execute("SELECT COUNT(*) FROM trials WHERE status='queued' AND (? IS NULL OR run_id=?)",
+                               (run_id, run_id)).fetchone()[0]
+
+    def events_after(self, event_id: int, types: tuple[str, ...]) -> list[sqlite3.Row]:
+        marks = ",".join("?" * len(types))
+        return self.db.execute(f"SELECT e.id, e.trial_id, e.type, e.payload_json, t.task_id, t.attempt FROM events e"
+                               f" JOIN trials t ON t.id = e.trial_id WHERE e.id > ? AND e.type IN ({marks})"
+                               f" ORDER BY e.id", (event_id, *types)).fetchall()
+
+    def max_event_id(self) -> int:
+        return self.db.execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()[0]
 
     def live_claims(self) -> set[str]:
         """Claim tokens of trials that are running under an unexpired lease."""
