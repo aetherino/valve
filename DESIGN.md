@@ -43,6 +43,16 @@ Status: draft for discussion. **(proposed)** marks decisions still open to chang
 | Model | `claude-opus-5-5` for both agents | — | Single model, set per run; dev uses $0 test agents |
 | Remote agents | Tool-level protocol (+ MCP/ACP adapters later) | Networked filesystem | Split-brain runtimes, latency, POSIX edge cases |
 | Names | `Sandbox` / chamber / Chamber API | `Environment` / Env API | "Environment" collided with env vars and mini's own term |
+| Agent stops its own chamber (`kill 1`, `pkill tail`, `kill -9 -1`) | Graded: `ChamberStopped`, session ends, stopped container still snapshotted (`docker cp` works on it) | infra_error (`rc != 0 and not alive()`) | Review: an agent could exclude any failing trial by stopping its chamber. Docker's own records decide: container still exists, `exited`, no `kill`/`stop` event (API-initiated stops leave one), not stopped by the harness, exit ≠ 255 → the agent's. The same rule grades a submission that kills the *verifier's* PID 1 (saboteur agent) |
+| Reaping scope | Every container labeled `vals.home=<hash of the DB path>`; `reap_stale` filters by it | `vals.managed=1` + this DB's live claims | A worker, prune or pytest with another `VALS_HOME` deleted other homes' live trials |
+| Installed CLI output | stdout is the exec's own output, streamed to a host file; every number sanitized; any parse failure → agent_error | `> /tmp/vals/output.jsonl` in the chamber, read back with `get` | The agent can rewrite a chamber file; malformed `usage`/`total_cost_usd`/`num_turns` crashed the parser → infra_error |
+| Provider failures | infra_error kind `model_api` (retried), only when clearly the provider's *and* before the agent acted: Claude Code `is_error` result matching an API/auth/rate-limit/overload pattern with no `tool_use` before it; a sidecar's `finish(model_error)` with zero chamber commands | Graded 0 | A bad key or an outage scored as agent failures. Once the agent has run a tool it could forge the line (it can write to the CLI's stdout) or an adapter could use it to dodge a hard task, so after that it's graded |
+| Missing secrets | Required `secrets` checked at submit (nothing queued) and in PREPARE (InfraError `config`); `optional_secrets` for the rest | Silently skipped | An unset `ANTHROPIC_API_KEY` produced a run of 0 scores |
+| Sidecar image at launch | Pinned image id from `prepare()`, `docker run --pull never`; `docker run` exit 125/126/127 before `hello` → infra_error | Tag; any exit → agent_error | A missing tag would pull a squattable `vals/agent-…` from Docker Hub; a daemon error / name conflict is not the agent's. Before `hello` the agent hasn't seen the task, so this can't be used to dodge one |
+| Spend on timeout | Numbers from a `finish` sent during the cancel grace are kept (watchdog only overrides the status); installed without a `result` event sums the assistant events' token usage | Outcome replaced with zeros | Timed-out trials recorded $0 spend |
+| Supervisor shutdown | SIGTERM/SIGHUP take the Ctrl-C path; each trial child watches its parent and, if it's gone, reaps its claim's containers and releases the trial | Default signal handling | SIGTERM skipped `finally`; children (own sessions) and their containers outlived the worker and kept spending |
+| Inputs drift | `folder_digest` of the agent and benchmark folders recomputed in PREPARE; mismatch → infra_error `adapter` ("inputs changed since submit") | Trust the digest from submit | The trial ran whatever was in the folders at claim time, under the manifest of what was submitted |
+| Final snapshot | `docker kill` the chamber, then `docker cp` from the stopped container | Snapshot a running chamber | busybox `timeout` leaves grandchildren running, which kept writing into the snapshot |
 
 ## 1. Goals and non-goals
 
@@ -90,7 +100,8 @@ Nobody standard runs Claude Code as a sidecar. The pros accept a modified task i
 ```
           host (worker → trial subprocess)
  ┌──────────────────────────────────────────────────────────────────────┐
- │ 1 PREPARE   tooling container runs the benchmark's own setup script  │
+ │ 1 PREPARE   re-check inputs digest + required secrets; build/pin     │
+ │             images; tooling container runs the benchmark's setup     │
  │             → workdir/visible/   (goes into chamber)                 │
  │             → workdir/eval/      (never enters chamber by default)   │
  │                                                                      │
@@ -100,10 +111,12 @@ Nobody standard runs Claude Code as a sidecar. The pros accept a modified task i
  │                                                                      │
  │ 3 AGENT     sidecar: start agent container, Chamber API over stdio,  │
  │               agent acts on chamber via Chamber API (§5.1)           │
- │             installed: install into chamber, run CLI, copy logs out  │
+ │             installed: chamber = prebuilt runtime layer; run CLI,    │
+ │               stdout streamed to the host, copy logs out             │
  │             host (dev): agent as host subprocess, same protocol      │
  │                                                                      │
- │ 4 COLLECT   docker cp /workspace → snapshot.tar; stop + remove       │
+ │ 4 COLLECT   docker kill (halt) → docker cp /workspace → snapshot.tar │
+ │             from the stopped container; remove                       │
  │                                                                      │
  │ 5 VERIFY    fresh verifier container: snapshot + eval/ overlaid      │
  │             (eval files overwrite agent-made copies) → grading cmd   │
@@ -127,23 +140,28 @@ class Sandbox(Protocol):              # sandbox/__init__.py; any isolated contai
     id: str
     shell: list[str]                  # ["sh", "-c"] for alpine, ["bash", "-lc"] otherwise (probed once)
     def alive(self) -> bool: ...      # asks Docker; decides harness-vs-agent fault, never output text
+    def exists(self) -> bool: ...     # running or stopped (a stopped one can still be read)
     def exec(self, cmd: str, *, timeout: int, cwd: str = "/workspace",
-             env: dict[str, str] | None = None, stdin: bytes | None = None) -> ExecResult: ...
+             env: dict[str, str] | None = None, stdin: bytes | None = None,
+             secret_env: dict[str, str] | None = None,
+             stdout_path: Path | None = None) -> ExecResult: ...   # raises ChamberStopped / InfraError
     def put(self, path: str, data: bytes) -> None: ...
-    def get(self, path: str) -> bytes: ...
+    def get(self, path: str) -> bytes: ...                       # works on a stopped sandbox (docker cp)
     def put_dir(self, local_dir: Path, dest: str) -> None: ...
     def snapshot(self, path: str, tar_path: Path) -> None: ...
+    def halt(self) -> None: ...       # kill every process, keep the filesystem (before the snapshot)
     def stop(self) -> None: ...
 
 class SandboxProvider(Protocol):
     def ensure_image(self, image: str | None = None, *, dockerfile: Path | None = None) -> str: ...  # -> image id
     def create(self, image: str, *, labels: dict[str, str], network: str = "none",
                cpus: float = 1.0, memory: str = "1g") -> Sandbox: ...
-    def reap(self, labels: dict[str, str]) -> int: ...          # never raises
-    def reap_stale(self, live_claims: set[str]) -> int: ...     # dead workers' leftovers
+    def reap(self, labels: dict[str, str]) -> int: ...                     # never raises
+    def reap_stale(self, live_claims: set[str], home: str) -> int: ...     # this home's dead workers' leftovers
 
-class AgentLauncher(Protocol):        # launchers.py; Host today, Docker/Remote later
-    def launch(self, agent: AgentSpec, stderr_path: Path) -> AgentSession: ...   # transport + wait/kill
+class AgentLauncher(Protocol):        # launchers.py; Host (dev) and Docker (sidecar) today, Remote later
+    def prepare(self, agent: AgentSpec) -> str | None: ...       # build the image; -> pinned id
+    def launch(self, agent: AgentSpec, stderr_path: Path, labels: dict[str, str]) -> AgentSession: ...
 
 class BenchmarkAdapter:               # benchmarks.py; one YAML-driven class for script-based benchmarks
     def prepare(self, task, workdir, labels) -> PreparedTask: ...                 # visible/ + eval/
@@ -152,7 +170,8 @@ class BenchmarkAdapter:               # benchmarks.py; one YAML-driven class for
 
 - **The shell belongs to `Sandbox`.** The agent says what to run; the sandbox knows how its image runs it.
 - **Sidecar agents act only through the Chamber API**, so the harness records every action.
-- **Installed agents** use `Sandbox.exec` to install and launch (instruction via stdin, never argv), then `get` to pull their native transcript.
+- **Installed agents** run in a chamber created from their prebuilt runtime layer; `Sandbox.exec` launches the CLI (instruction via stdin, never argv) with its stdout streamed to a host file (`stdout_path`), and `snapshot` pulls the CLI's own logs.
+- **Whose fault is a stopped sandbox?** `exec`/`put` on a container that is no longer running ask Docker: still exists, `exited`, no `kill`/`stop` event, not halted by the harness, exit ≠ 255 → `ChamberStopped` (the agent's: `kill 1` and friends; in the verifier, the submission's). Removed, API-stopped, or a daemon we can't ask → `InfraError`. Residual: someone running `docker kill` on a chamber by hand after Docker's event buffer has rolled over would be blamed on the agent.
 - **Agent tools are not modified.** Adapters translate mechanics only and record what they did.
 - A YAML spec covers the common case; a benchmark or agent with unusual needs supplies a Python class implementing the same protocol.
 
@@ -182,7 +201,7 @@ Every sidecar agent runs in its own container. The only way into the chamber is 
 | `put` | `{path, data_b64}` | `{}` |
 | `get` | `{path}` | `{data_b64}` |
 
-- A non-zero exit code is a normal result. Error replies: `-32602` bad params, `-32601` unknown method, `-32001` not found, `-32002` cancelled (deadline passed) — all the agent's problem, the session continues. Only `-32000` (chamber broken, confirmed via `Sandbox.alive()`) aborts the trial as `infra_error`.
+- A non-zero exit code is a normal result. Error replies: `-32602` bad params, `-32601` unknown method, `-32001` not found, `-32002` cancelled (deadline passed) — all the agent's problem, the session continues. `-32003` chamber stopped (the agent stopped it from the inside): the session winds down like a cancel (only `finish`/`event`/`artifact`), the outcome is `agent_error`, and the workspace is still snapshotted and graded. Only `-32000` (chamber broken through no fault of the agent, confirmed with Docker) aborts the trial as `infra_error`.
 - Output is capped (default 1 MB) and flagged `truncated`.
 - The worker applies the image's shell, per-command timeout and logging; the agent can't bypass them.
 
@@ -208,15 +227,16 @@ JSON-RPC 2.0, newline-delimited. W = worker, A = agent.
 |---|---|---|---|
 | 1 | A → W | `hello` (request) | `{protocol: "vals-agent/1", agent: {name, version}, capabilities: ["exec", "files", "events"]}` |
 | 2 | W → A | `hello` result | `{protocol: "vals-agent/1", trial_id}` — mismatched major version → `agent_error` (graded 0: the agent's adapter is wrong) |
-| 3 | W → A | `start` (notification) | `{instruction, config: {model, step_limit, cost_limit_usd, …}, workspace: "/workspace", deadline_unix}` |
+| 3 | W → A | `start` (notification) | `{instruction, config: {model, step_limit, cost_limit_usd, …}, workspace: "/workspace", deadline_unix, chamber: {uname}}` — `chamber.uname` so an agent needn't spend a chamber command on it before its first model call |
 | 4 | A → W | `exec` / `put` / `get` (requests) | Chamber API (§5.1) |
 | 4 | A → W | `event` (notification, optional) | `{type, data}` — progress, step summaries, model usage; streamed into the `events` table |
 | 4 | A → W | `artifact` (request) | `{name, data_b64}` — native trajectory, logs; stored under `agent_logs/` |
-| 5 | A → W | `finish` (request) | `{exit_status, steps, input_tokens, output_tokens, cost_usd}` |
+| 5 | A → W | `finish` (request) | `{exit_status, steps, input_tokens, output_tokens, cost_usd, message}` — numbers sanitized (non-negative, finite, else 0) |
 | — | W → A | `cancel` (notification) | `{reason}` — agent should stop and `finish`; worker kills it after a grace period |
 
 - **Config travels in `start`, not env vars.** Only secrets stay in the agent's own environment (they never cross the protocol).
-- **Process exit** after `finish` is normal. Exit or disconnect without `finish` = `agent_error` (graded 0), unless the worker can attribute it to the harness → `infra_error`. Deadline passed → worker sends `cancel`, then kills → `timeout`.
+- **Process exit** after `finish` is normal. Exit or disconnect without `finish` = `agent_error` (graded 0), unless the worker can attribute it to the harness → `infra_error`: `docker run` exiting 125/126/127 before `hello` (daemon error, name conflict, command not found; the agent hasn't seen the task yet, so it can't use this to dodge one). Deadline passed → worker sends `cancel`, then kills → `timeout`; numbers from a `finish` sent during the grace period are kept (that spend is real).
+- `exit_status` is one of `submitted | step_limit | cost_limit | timeout | agent_error | gave_up | model_error`. `model_error` (the adapter's model provider failed: auth, rate limit, overload, unknown model) becomes infra_error kind `model_api` only if the agent never touched the chamber (harness-counted commands = 0); otherwise it is graded as `agent_error`. Residual trust: an adapter could claim it before its first command; mini-swe-agent's runner only does so for litellm's provider exceptions.
 - The instruction never appears in argv or env.
 
 ### 5.3 Extension seams
@@ -226,7 +246,7 @@ Each seam is an interface with one v1 implementation. Making agents remote, or m
 | Interface | Responsibility | v1 implementation | Future implementations |
 |---|---|---|---|
 | `Transport` | Carry protocol messages: `send(msg)`, `recv() -> msg`, `close()` | `StdioTransport` (pipes of `docker run -i`) | `WebSocketTransport` (TLS + per-trial bearer token), `HttpLongPollTransport` |
-| `AgentLauncher` | Start an agent for a trial and hand back a session: `launch(agent_spec, trial) -> AgentSession`; `AgentSession` = transport + `wait()` + `kill()` | `DockerLauncher` (sidecar), `InstalledLauncher`, `HostLauncher` (dev) | `RemoteLauncher`: POST to the vendor's `/sessions`, get a WebSocket URL, agent dials back |
+| `AgentLauncher` | Start an agent for a trial and hand back a session: `launch(agent_spec, trial) -> AgentSession`; `AgentSession` = transport + `wait()` + `kill()` | `DockerLauncher` (sidecar), `HostLauncher` (dev); installed agents use `InstalledRunner` (no session: the CLI is driven with `Sandbox.exec`) | `RemoteLauncher`: POST to the vendor's `/sessions`, get a WebSocket URL, agent dials back |
 | Agent session protocol | Handshake, task, actions, events, artifacts, finish (§5.2) | `vals-agent/1` | additive methods; major bump only for breaking changes |
 | `SandboxProvider` | Create chambers and verifiers: `create(image, limits, network, labels) -> Sandbox` | `DockerSandboxProvider` | Modal, Daytona, Firecracker, remote Docker host |
 | `Sandbox` | Act on one sandbox: `exec`, `put`, `get`, `snapshot`, `stop` | `DockerSandbox` | one per `SandboxProvider` |
@@ -309,13 +329,13 @@ result_parser: json_stdout
 
 ```yaml
 name: mini-swe-agent
-version_cmd: "mini --version"
+version: "2.4.6"
 placement: sidecar                         # sidecar | installed | host (dev only)
-bridge: api
-image: vals/agent-mini-swe-agent           # built from agents/mini-swe-agent/Dockerfile: python + mini + ChamberEnvironment
-entrypoint: ["python", "-m", "vals_mini_runner"]   # reads instruction from stdin, config from env
-secrets: [MODEL_API_KEY]                   # into the agent container only
-defaults: { model: anthropic/claude-opus-5-5, step_limit: 50, cost_limit: 1.0 }   # litellm model string
+command: ["python", "agent.py"]            # run in the image built from agents/mini-swe-agent/Dockerfile
+                                           # (python + mini + ChamberEnvironment + the SDK); config arrives in `start`
+secrets: [ANTHROPIC_API_KEY]               # required: submit refuses the run if unset; agent container only
+optional_secrets: [ANTHROPIC_WORKSPACE_ID] # forwarded if set
+defaults: { model: anthropic/claude-opus-5-5, step_limit: 50, cost_limit_usd: 1.0 }   # litellm model string
 ```
 
 ```yaml
@@ -336,10 +356,11 @@ defaults: { model: claude-opus-5-5, step_limit: 50 }   # step_limit -> --max-tur
 ```
 
 How installed agents run (`installed.py`):
-- **Runtime as an image layer, never installed live.** `install.Dockerfile` is built `FROM` the pinned task image (tagged `vals/base:<id>` so it can't move), cached by content hash, and pinned as `agent_image`. The chamber is created from it. Alpine (apk, musl) and Debian (apt) both work.
-- **Driven from the worker with `Sandbox.exec`**: instruction written to `/tmp/vals/instruction.txt` and piped on stdin, output streamed to a file, then parsed (`tool_use` events → transcript; the `result` event → exit status, turns, tokens incl. cache, cost).
+- **Runtime as an image layer, never installed live.** `install.Dockerfile` is built `FROM` the pinned task image (tagged `vals/base:<id>` so it can't move), cached by a hash of the whole agent folder (the build context) + the task image id, and pinned as `agent_image`. The chamber is created from it. Alpine (apk, musl) and Debian (apt) both work.
+- **Driven from the worker with `Sandbox.exec`**: instruction written to `/tmp/vals/instruction.txt` and piped on stdin. The CLI's stdout is the exec's own output, streamed to `agent_logs/output.jsonl` on the host as it's produced (capped at 50 MB), so the agent can't rewrite it afterwards. Parsed: `tool_use` events → transcript; the last `result` event → exit status, turns, tokens incl. cache, cost. Every number is sanitized and any parse failure is `agent_error`. No `result` (killed at the wall clock) → tokens summed from the assistant events (cost unknown, recorded as 0). An `is_error` result that is recognizably the provider's (API error 401/403/404/408/429/5xx, auth/permission/rate-limit/overload errors, invalid key, no credit) before any `tool_use` → `model_error` → infra_error `model_api`.
+- **The agent can stop the chamber** (its tools run as root next to PID 1). That's `ChamberStopped`: the outcome is `agent_error`, the streamed output and logs are still collected (`docker cp` works on a stopped container), and the workspace is graded.
 - **Root, without skipping permissions.** Claude Code refuses `--dangerously-skip-permissions` as root (and 2.1.312 ignores `IS_SANDBOX`), so its tools are pre-approved with `--allowedTools`. The chamber stays root, as the task expects.
-- **Secrets** travel as `docker exec -e NAME` through the CLI's own environment, never argv. They are visible to the agent inside the chamber (v1 risk, documented; v2 model proxy with a dummy key).
+- **Secrets** travel as `docker exec -e NAME` through the CLI's own environment, never argv. They are visible to the agent inside the chamber (v1 risk, documented; v2 model proxy with a dummy key), and to anyone with Docker access on the host (`docker inspect` of the exec).
 - **Network:** the chamber gets egress because the CLI calls its model from there (v2: proxy only).
 - **Observed:** Opus 5.5 via Claude Code scored 5/5 on bash-operations, 2/3 on python-tasks. On py-003 it answered in chat instead of writing `solution.py`: the benchmark's prompt never names the file. Correctly graded 0; the harness doesn't rewrite benchmark prompts.
 
@@ -362,7 +383,7 @@ Precedence: RunSpec > BenchmarkSpec/AgentSpec defaults > harness defaults.
 
 ### 6.4 TrialSpec — resolved at enqueue, written to `manifest.json`
 
-The fully resolved RunSpec for one `(task_id, attempt)`, plus `inputs_digest`: content hashes of the benchmark folder (dataset, scripts, grader) and the agent folder. `manifest_hash` covers all of it but excludes per-run ids and host paths, so **same hash = same experiment**, and editing `grade.py` changes it. At run time `manifest.json` also records `pins`: the task and tooling **image ids**, and containers are created from those ids, not tags.
+The fully resolved RunSpec for one `(task_id, attempt)`, plus `inputs_digest`: content hashes of the benchmark folder (dataset, scripts, grader) and the agent folder. `manifest_hash` covers all of it but excludes per-run ids and host paths, so **same hash = same experiment**, and editing `grade.py` changes it. At run time `manifest.json` also records `pins`: the task, tooling and agent **image ids**, and containers are created from those ids, not tags. PREPARE recomputes `inputs_digest` from the folders; if they changed since submit the try fails as infra_error `adapter` ("inputs changed since submit"), so a trial never runs code other than what its manifest describes.
 
 ## 7. Workers and concurrency
 
@@ -378,13 +399,13 @@ harness worker --slots 4                      (supervisor; the only writer of fi
    └─ trial wall clock: kill process group + reap by claim label → infra_error (timeout_harness)
 ```
 
-- **Slot = the resource unit.** One trial runs at most 2 containers at once (chamber + sidecar, or chamber alone), each capped by `limits.cpus/memory`. Size slots so `slots × per-trial limits ≤ machine`.
-- **Each trial runs in a child process** in its own process group. A crash or hang is isolated to that trial: a child that exits without a result becomes `infra_error` (`adapter`); one that overruns `trial_budget_s` (default: agent timeout + verify timeout + 15 min for image builds; override with `--limit trial_timeout_s=…`) is killed with its whole group, its containers are reaped by claim label, and it's recorded as `timeout_harness`.
-- **Clean shutdown.** On Ctrl-C the supervisor kills its children, reaps their containers and *releases* their claims back to the queue (fenced, no infra attempt charged).
+- **Slot = the resource unit.** A trial runs a tooling container (prepare), then the chamber + its sidecar (`limits.cpus/memory` for the chamber, 1 CPU / 2 GB for the sidecar), then a verifier: at most 2 containers at once. Size slots so `slots × per-trial limits ≤ machine`.
+- **Each trial runs in a child process** in its own process group. A crash or hang is isolated to that trial: a child that exits without a result becomes `infra_error` (`adapter`); one that overruns `trial_budget_s` (default: agent timeout + verify timeout + `PREPARE_SLACK_S` = 60 min; override with `--limit trial_timeout_s=…`) is killed with its whole group, its containers are reaped by claim label, and it's recorded as `timeout_harness`. First-time image work happens inside that budget, in PREPARE; each step has its own timeout (pull 600 s, tooling build 900 s, sidecar build 1200 s / installed layer 1800 s, prepare script 300 s) and their worst-case sum fits the slack (a unit test keeps them in sync).
+- **Clean shutdown.** On Ctrl-C, SIGTERM or SIGHUP the supervisor kills its children, reaps their containers and *releases* their claims back to the queue (fenced, no infra attempt charged); a child that had already written its result is recorded instead. If the supervisor dies without cleaning up (SIGKILL), each child notices its parent is gone (polls `getppid()`), reaps its claim's containers, releases the trial and exits, so nothing keeps running or spending unsupervised. Job files (`jobs/*.json`) are removed however a trial ends.
 - **Multiple workers are fine.** Each claims atomically from SQLite (WAL mode). Multi-host would need Postgres; out of scope.
 - **Leases.** A claimed trial has `lease_until`, renewed every 10 s. An expired lease (dead worker) lets another worker reclaim it, counting one infra attempt; past `policy.infra_retries` the trial is closed as `infra_error` (`worker_lost`) instead of being handed out forever.
 - **Fencing tokens.** Every claim gets a fresh `claim_token`; every later write (`set_status`, `heartbeat`, `finish`) must present it. A worker that stalled past its lease is fenced out: its writes fail (`LostLease`), its result is dropped, and because containers and artifact folders are per claim (`vals.claim` label, `try<N>/` folder) it can't delete or overwrite the new owner's.
-- **Startup reaper.** A worker removes `vals.*` containers whose claim isn't live (`reap_stale`).
+- **Startup reaper.** A worker removes containers of *its own home* (`vals.home` = hash of the DB path) whose claim isn't live (`reap_stale`). Another `VALS_HOME` (a second checkout, a test run) never touches them.
 - **The worker loop never dies on a trial.** Any exception becomes that trial's `infra_error`; cleanup (`reap`) never raises.
 - **Optional:** a per-model concurrency cap to stay under provider rate limits.
 
@@ -395,9 +416,9 @@ harness worker --slots 4                      (supervisor; the only writer of fi
 Trial states: `queued → preparing → running_agent → verifying → graded | infra_error | cancelled`.
 
 **Error taxonomy**
-- Agent failed → `graded`, score 0, counts toward accuracy. This includes everything the agent controls: wrong answer, step/cost limit, timeout, gave up, crashed, malformed protocol messages, a deleted workspace (empty submission), unsafe links in its snapshot (dropped and reported), a submission that hangs the grader.
-- Harness/infra failed → `infra_error`: image pull, Docker failure confirmed by `Sandbox.alive()`, adapter bug, grader output we can't parse, lost worker. Retried up to `policy.infra_retries`; excluded from accuracy, reported separately.
-- **Rule:** nothing the agent can do may produce an `infra_error`, or an agent could drop its own failures from the denominator. The vandal test agent enforces this.
+- Agent failed → `graded`, score 0, counts toward accuracy. This includes everything the agent controls: wrong answer, step/cost limit, timeout, gave up, crashed, malformed protocol messages or CLI output, a deleted workspace (empty submission), unsafe links in its snapshot (dropped and reported), stopping its own chamber (`kill 1`), a submission that hangs or stops the grader.
+- Harness/infra failed → `infra_error`: image pull/build, Docker failure (confirmed with Docker: container removed, API-stopped, daemon unreachable), `docker run` of the sidecar failing before `hello`, adapter bug, inputs changed since submit, a required secret missing for the worker (`config`), the model provider failing before the agent acted (`model_api`), grader output we can't parse, lost worker. Retried up to `policy.infra_retries`; excluded from accuracy, reported separately.
+- **Rule:** nothing the agent can do may produce an `infra_error`, or an agent could drop its own failures from the denominator. The vandal and saboteur test agents enforce this; `model_api` is only possible before the agent has acted (§5.2, §6.2).
 - `cancelled`: `harness cancel --run_id` cancels queued trials; running trials finish normally.
 
 ### 8.1 TrialResult
@@ -416,7 +437,7 @@ Trial states: `queued → preparing → running_agent → verifying → graded |
 }
 ```
 
-`error` when `infra_error`: `{ "kind": "image" | "docker" | "prepare" | "adapter" | "verifier" | "worker_lost" | "timeout_harness", "message": "…" }` (`timeout_harness` = the trial wall clock ran out). Results also carry `try` (1 + infra retries) and per-trial `spent_usd` summed over every try.
+`error` when `infra_error`: `{ "kind": "image" | "docker" | "prepare" | "adapter" | "verifier" | "config" | "model_api" | "worker_lost" | "timeout_harness", "message": "…" }` (`timeout_harness` = the trial wall clock ran out). Results also carry `try` (1 + infra retries) and per-trial `spent_usd` summed over every try.
 
 ### 8.2 RunResult (`harness results`)
 
@@ -455,10 +476,11 @@ The run report is a SQL aggregation over `runs ⋈ trials ⋈ results`.
 
 - Chamber: `--network none` for sidecar agents; egress for installed agents in v1 (documented), proxy-only in v2.
 - Agent container: egress to the model API only (v1: allow egress; v2: model proxy). Gets its Chamber API pipes and its declared `secrets`, nothing else.
-- Secrets never enter the chamber for sidecar agents. Installed agents receive only their declared `secrets`.
+- Secrets never enter the chamber for sidecar agents. Installed agents receive only their declared `secrets` / `optional_secrets`. Either way they are visible to anyone with Docker access on the host: `docker inspect` shows a sidecar's `Config.Env`, and an installed agent's exec environment (v2: model proxy with per-trial keys).
 - Workspace moves via `docker cp` / tar, not bind mounts.
 - Eval files absent from the chamber by default; always re-overlaid at verify.
-- Containers labeled `vals.trial_id`, `vals.run_id`, `vals.claim`; reaped per claim in `finally` and on worker start.
+- Containers labeled `vals.trial_id`, `vals.run_id`, `vals.claim`, `vals.home`; reaped per claim in `finally`, and per home on worker start / `harness prune`.
+- The sidecar runs from its pinned image id with `--pull never`: nothing is ever pulled from a registry under a `vals/…` name.
 - Every sandbox is hardened: `--init` (reaps zombies), `--pids-limit 512`, `--security-opt no-new-privileges`, `--cap-drop ALL` plus only the file-ownership caps tasks need (CHOWN, DAC_OVERRIDE, FOWNER, FSETID, SETUID, SETGID, KILL). Disk isn't capped: overlay2 on Docker Desktop doesn't support `--storage-opt size`.
 - Host memory is bounded: exec output streams with a 1 MB cap, `get` 10 MB, snapshot 1 GB (streamed to disk), protocol messages 32 MB.
 - Agent snapshots are unpacked with tarfile's `data` filter; rejected members and links escaping the workspace are dropped and listed in the grade's `harness.skipped_files`.
@@ -471,7 +493,7 @@ harness run --agent agents/mini-swe-agent --benchmark bash-operations [--task_id
 harness status [--run_id ID]        # no id → list active runs
 harness results --run_id ID [--format json|table|summary]
 harness worker [--slots N] [--once]
-harness prune [--dry-run]          # outdated vals/* images + dead workers' containers
+harness prune [--dry-run]          # unneeded vals/* images + this home's dead workers' containers
 harness cancel --run_id ID
 ```
 
@@ -486,9 +508,10 @@ harness cancel --run_id ID
 | Limit | Default | Enforced by | On expiry |
 |---|---|---|---|
 | Per command | 30 s (mini's default) | Chamber API / `Sandbox.exec` | command returns `timed_out: true`; agent continues |
-| Agent wall clock | 10 min | recv deadline → `cancel` + 10 s grace (only finish/event/artifact accepted); a watchdog kills the agent process 5 s later even if the worker is blocked writing to an agent that stopped reading | `exit_status: timeout`, graded |
+| Agent wall clock | 10 min | recv deadline → `cancel` + 10 s grace (only finish/event/artifact accepted); a watchdog kills the agent process 5 s later even if the worker is blocked writing to an agent that stopped reading | `exit_status: timeout`, graded; tokens/cost from a `finish` during the grace are kept |
 | Verify | 2 min | in-container `timeout` | graded 0 (the submission runs inside the grader, so a hang is the agent's) |
-| Trial wall clock | agent + verify + 15 min (`trial_timeout_s`) | supervisor kills the trial's process group + reaps by claim label | `infra_error` (kind `timeout_harness`) |
+| Image pull / builds | 600 s / 900–1800 s each (§7) | `docker` client timeout | `infra_error` (kind `image`) |
+| Trial wall clock | agent + verify + 60 min (`trial_timeout_s`; the 60 min cover first-time image builds) | supervisor kills the trial's process group + reaps by claim label | `infra_error` (kind `timeout_harness`) |
 | Lease | 60 s, renewed every 10 s | DB | trial requeued |
 
 ## 13. Testing without a model
@@ -498,8 +521,9 @@ Built-in test agents make the whole pipeline testable deterministically at $0 mo
 - **noop** — does nothing. Expect 0%; proves graders don't pass empty workspaces.
 - **cheater** — tries every grading attack found so far: recon for tests, a fake `test_solution.py`, a planted `pytest.py` and `conftest.py`, a submission that calls `os._exit(0)` at import, absolute / escaping / overlay-redirect symlinks, and Docker's error text in its output. Expect 0% and no infra errors.
 - **vandal** — tries to turn its own failure into an infra error: malformed protocol messages, garbage `finish` numbers, `rm -rf /workspace`. Expect 0% and no infra errors.
+- **saboteur** — stops its own chamber from the inside (`kill 1`, killing the keep-alive process, `kill -9 -1`; one per task) after planting a `solution.py` that kills the verifier's PID 1 at import. Expect 0%, no infra errors, and its reported spend kept. A fake installed CLI does the same from inside an installed chamber.
 
-They run as sidecar containers like any other agent; a further integration test proves a sidecar agent sees no host files, none of the worker's environment, and only its declared secrets. Unit tests cover specs, parsers, graded-workspace safety, the protocol (malformed params, an agent that stops reading), the store (fencing, retry caps, spend) and aggregation; integration tests run every test agent against both benchmarks in real Docker.
+They run as sidecar containers like any other agent; a further integration test proves a sidecar agent sees no host files, none of the worker's environment, and only its declared secrets. Unit tests cover specs, parsers (incl. hostile stream-json and provider-error classification), graded-workspace safety, the protocol (malformed params, an agent that stops reading, a stopped chamber, spend kept on timeout, `model_error`, launch failures), the store (fencing, retry caps, spend), aggregation, pruning and the prepare budget; integration tests run every test agent against both benchmarks in real Docker, plus the worker lifecycle (SIGTERM, a SIGKILLed supervisor, two homes that must not reap each other, inputs edited after submit, missing secrets).
 
 ## 14. Repo layout and image builds
 
@@ -508,15 +532,16 @@ vals-harness/
 ├── src/vals_harness/       cli.py · service.py · specs.py · sandbox/ (Sandbox, docker.py) · benchmarks.py · protocol.py
 │                           launchers.py · chamber_api.py · installed.py · trial.py · trial_child.py · store.py · results.py · errors.py
 ├── src/vals_agent_sdk/     client.py (agent side of vals-agent/1, stdlib only)
-├── agents/                 mini-swe-agent/ · claude-code/ · oracle/ · noop/ · cheater/ · vandal/
-├── benchmarks/             bash-operations/ · python-tasks/   (starter files untouched + harness.yaml)
-├── docker/                 tooling images
+├── agents/                 mini-swe-agent/ · claude-code/ · oracle/ · noop/ · cheater/ · vandal/ · saboteur/
+├── benchmarks/             bash-operations/ · python-tasks/   (starter files untouched + harness.yaml; python-tasks
+│                           carries its tooling.Dockerfile)
 ├── tests/
 └── README.md · DESIGN.md · architecture.excalidraw
 ```
 
-- Agent and tooling images are built from their folders, tagged by a hash of the folder contents (`vals/agent-mini-swe-agent:<hash>`), built lazily at enqueue if missing. `harness build` builds all ahead of time.
-- Task images are pulled once and pinned by digest in each manifest.
+- Agent and tooling images are built from their folders, tagged by a hash of the folder contents (`vals/agent-mini-swe-agent:<hash>`; installed layers: agent folder + task image id). They are built in PREPARE, at claim time, if missing (there is no `harness build`; the first trial of a new version pays for the build inside its trial budget, §7).
+- Task images are pulled once and pinned by id in each manifest.
+- `harness prune` removes `vals/*` images nothing needs: it keeps what the current agent/benchmark folders build, installed layers and `vals/base:` tags for the task images of every run in the DB, and every image a queued or running trial needs (even an agent outside `agents/`); Docker refuses to remove images a container still uses.
 
 ## 15. Open questions
 
