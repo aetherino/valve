@@ -21,6 +21,7 @@ installed:
   logs_dir: /tmp/vals/agent
   output_parser: claude_stream_json
 secrets: [ANTHROPIC_API_KEY]
+expects: [bash]   # met by the install layer, which adds bash to the chamber
 defaults:
   model: claude-opus-5-5
   step_limit: 50          # -> --max-turns

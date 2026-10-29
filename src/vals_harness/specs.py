@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import os
 from pathlib import Path
 from typing import Any, Literal
@@ -142,6 +143,9 @@ class AgentSpec(Frozen):
     installed: InstalledRuntime | None = None   # placement: installed / phantom
     secrets: list[str] = []                 # env var names forwarded to the agent only; required
     optional_secrets: list[str] = []        # forwarded if set (e.g. ANTHROPIC_WORKSPACE_ID)
+    # Programs the agent assumes the chamber has (e.g. bash). Not enforced: the harness
+    # checks them against the task image and records any that are missing (`env`).
+    expects: list[str] = []
     defaults: dict[str, Any] = {}           # model + limit defaults
     root: Path                              # set by the loader: the agent folder
 
@@ -149,6 +153,9 @@ class AgentSpec(Frozen):
     def _placement_fields(self) -> AgentSpec:
         if self.placement in ("installed", "phantom") and self.installed is None:
             raise ValueError(f"placement: {self.placement} needs an `installed:` section")
+        bad = [e for e in self.expects if not re.fullmatch(r"[A-Za-z0-9._+-]+", e)]
+        if bad:
+            raise ValueError(f"expects must be program names, got {bad}")
         if self.placement in ("host", "sidecar") and not self.command:
             raise ValueError(f"placement: {self.placement} needs a `command`")
         return self

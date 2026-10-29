@@ -49,3 +49,10 @@ def test_manifest_hash_is_stable_and_sensitive(root):
     b = resolve_trials(RunSpec(agent="agents/oracle", benchmark="python-tasks"), "r1", root, "test")
     c = resolve_trials(RunSpec(agent="agents/oracle", benchmark="python-tasks", limits={"cpus": 2}), "r1", root, "test")
     assert a[0].manifest_hash() == b[0].manifest_hash() != c[0].manifest_hash()
+
+
+def test_expects_must_be_program_names(tmp_path):
+    from vals_harness.specs import AgentSpec
+    AgentSpec(name="a", placement="sidecar", command=["x"], expects=["bash", "python3"], root=tmp_path)
+    with pytest.raises(ValidationError):
+        AgentSpec(name="a", placement="sidecar", command=["x"], expects=["bash; rm -rf /"], root=tmp_path)

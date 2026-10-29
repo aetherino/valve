@@ -56,6 +56,7 @@ class AgentOutcome:
     output_tokens: int = 0
     cost_usd: float = 0.0
     n_commands: int = 0         # counted by the harness, not reported by the agent
+    n_not_found: int = 0        # commands that exited 127 ("command not found"): an env-mismatch signal
     message: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -78,6 +79,7 @@ class ChamberApi:
         self.trial_id = trial_id
         self.command_timeout_s = command_timeout_s
         self.n_commands = 0
+        self.n_not_found = 0
         self._cancelling = False
         self._hello_done = False
         self._watchdog_fired = threading.Event()
@@ -121,6 +123,7 @@ class ChamberApi:
             # Keep any numbers the agent reported (a finish during the grace period).
             outcome.exit_status, outcome.message = "timeout", "agent killed at the wall-clock limit"
         outcome.n_commands = self.n_commands
+        outcome.n_not_found = self.n_not_found
         if outcome.exit_status == "model_error" and self.n_commands:
             # Once the agent has acted on the chamber, a claimed provider failure could be a
             # way to drop a failing trial from the accuracy denominator: graded instead.
@@ -256,6 +259,8 @@ class ChamberApi:
         r = self.sandbox.exec(cmd, timeout=max(1, timeout), cwd=cwd, env=env,
                               stdin=stdin.encode() if stdin is not None else None)
         self.n_commands += 1
+        if r.returncode == 127:
+            self.n_not_found += 1
         self.rec.transcript({"type": "exec", "cmd": cmd, **r.to_dict()})
         self.rec.event("exec", {"cmd": cmd[:500], "returncode": r.returncode,
                                 "duration_s": r.duration_s, "timed_out": r.timed_out})

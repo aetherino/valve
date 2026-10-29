@@ -19,6 +19,9 @@ installed:
     ANTHROPIC_CUSTOM_HEADERS: "anthropic-workspace-id: ${ANTHROPIC_WORKSPACE_ID}"   # only if set
   output_parser: claude_stream_json   # parsed by the phantom runner, which reports `finish`
 secrets: [ANTHROPIC_API_KEY]
+# Claude Code writes bash; in phantom mode its commands run in the chamber, so the
+# harness checks the chamber for bash and flags it if missing (it doesn't add it).
+expects: [bash]
 defaults:
   model: claude-opus-5-5
   step_limit: 50

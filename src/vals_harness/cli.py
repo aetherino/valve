@@ -198,6 +198,13 @@ def _print_summary(s: dict[str, Any]) -> None:
     click.echo(line)
     click.echo(f"trials: {_counts(s['counts'])}   cost: ${s['cost_usd']:.4f}"
                + (f"   wall: {s['duration_s']}s" if s["duration_s"] is not None else ""))
+    env = s.get("env") or {}
+    for prog, n in sorted((env.get("missing") or {}).items()):
+        click.echo(f"⚠ env: agent expects `{prog}`, missing in the chamber for {n}/{env['trials_checked']} trials"
+                   " (task image run as given; see DESIGN §8.3)")
+    if env.get("commands_not_found"):
+        click.echo(f"⚠ env: {env['commands_not_found']} command(s) not found (rc 127) "
+                   f"in {env['trials_with_not_found']} trial(s)")
 
 
 def main() -> None:

@@ -36,6 +36,7 @@ Status: draft for discussion. **(proposed)** marks decisions still open to chang
 | Claude Code as root | `--allowedTools` pre-approval | `--dangerously-skip-permissions` as non-root user | Claude Code refuses skip-permissions as root; switching user would change the task environment (many tasks need root) |
 | Installed runtime | Image layer FROM pinned task image | `npm install` inside a live chamber | Cached, reproducible (pinned id), no slow install inside a running trial |
 | Claude Code without polluting the chamber | Phantom box: mirror (same base + shared /workspace,/tmp) + phantom shell | ACP client; MCP tool swap; FUSE mirror; shared namespaces | Stock Claude Code, chamber offline and secret-free. ACP's delegation coverage is unverified; an MCP swap measures a different agent; FUSE/namespaces need CAP_SYS_ADMIN in the box |
+| Agent assumes bash, task image has none | Declare `expects`, probe, flag in results | Silently add bash to the chamber; rewrite the agent's prompt | The task image is the experiment; Vals measures and reports, it doesn't fix contestants or the course |
 | Benchmark scripts | Run in a tooling container | Run on the host | `prepare.py` installs packages; host stays clean |
 | Shell choice (`sh` vs `bash`) | The `Sandbox` | Each agent adapter | It's a property of the image; solved once for all agents |
 | Job unit | Trial | Run | Parallelism, per-trial retry, partial results early |
@@ -483,6 +484,16 @@ Trial states: `queued → preparing → running_agent → verifying → graded |
 
 - `accuracy.mean` = mean of per-attempt accuracies; each per-attempt accuracy = passed / graded for that attempt.
 - `sem` = standard error over per-attempt scores (Vals' method for multi-run benchmarks); over task-level scores if `attempts = 1`.
+
+### 8.3 Environment checks (visibility, not intervention)
+
+The task image is the experiment, so the harness never adds what an agent assumes is there; it makes mismatches visible instead.
+- **Agents declare** what they assume (`expects: [bash]` in `agent.yaml`): program names, once per agent. Assumptions are never inferred; that's the part that doesn't scale.
+- **The harness checks** them in the chamber before the agent starts (one `command -v` probe, ~50 ms, not shown to the agent) and records `env: {expects, missing}` with the trial's metrics.
+- **A generic signal needs no declaration**: the Chamber API counts commands that exit 127 ("command not found") per trial (`n_not_found`).
+- **Results aggregate both** (`summary.env`), and the CLI prints a warning, e.g. `⚠ env: agent expects bash, missing in the chamber for 5/5 trials`.
+- Example: `bash-operations` runs in alpine (no bash). Claude Code in phantom mode expects bash, so every trial is flagged, and its bash-only syntax failures are explainable from the results, not only from transcripts. In installed mode the install layer adds bash, so the check passes; that difference between modes is itself visible.
+- A labeled opt-in variant that provides the expected program (e.g. a static bash) would be a separate experiment, never mixed with official numbers.
 
 ## 9. Data and observability
 

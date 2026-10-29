@@ -81,6 +81,7 @@ class TrialRunner:
         t0 = time.monotonic()
         timings: dict[str, float] = {}
         outcome: AgentOutcome | None = None
+        env_check: dict[str, list[str]] | None = None
         result: dict[str, Any]
 
         try:
@@ -121,6 +122,7 @@ class TrialRunner:
                                       network=network, cpus=spec.limits.cpus,
                                       memory=spec.limits.memory, volumes=volumes) as chamber:
                 chamber.put_dir(prepared.visible_dir, WORKSPACE)
+                env_check = self._check_env(chamber, spec.agent.expects, rec)
                 if spec.policy.expose_eval_files and any(prepared.eval_dir.iterdir()):
                     chamber.put_dir(prepared.eval_dir, WORKSPACE)
                 if placement == "installed":
@@ -173,11 +175,30 @@ class TrialRunner:
                             "cost_usd": outcome.cost_usd, "n_commands": outcome.n_commands,
                             "steps": outcome.steps} if outcome else {})},
             "manifest_hash": spec.manifest_hash(),
+            "env": env_check,
         })
+        if outcome:
+            result["metrics"]["n_not_found"] = outcome.n_not_found
+        if env_check:
+            result["metrics"]["env"] = env_check   # stored with the metrics (no schema change)
         (folder / "result.json").write_text(json.dumps(result, indent=2))
         return result
 
     # ------------------------------------------------------------------ helpers
+
+    @staticmethod
+    def _check_env(chamber: Any, expects: list[str], rec: TrialRecorder) -> dict[str, list[str]] | None:
+        """Check the agent's declared assumptions against the chamber before the agent
+        starts. Nothing is changed or blocked: a mismatch is a recorded fact (the task
+        image is the experiment), surfaced in results so it can't hide in transcripts."""
+        if not expects:
+            return None
+        script = 'for p in "$@"; do command -v "$p" >/dev/null 2>&1 || echo "$p"; done'
+        r = chamber.exec(f"sh -c '{script}' sh " + " ".join(expects), timeout=30)
+        missing = sorted(set(r.output.split()) & set(expects))
+        check = {"expects": list(expects), "missing": missing}
+        rec.event("env_check", check)
+        return check
 
     @staticmethod
     def _check_inputs(spec: TrialSpec) -> None:

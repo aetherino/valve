@@ -54,3 +54,38 @@ def test_phantom_box_relays_its_shell_into_the_chamber(root, tmp_path, monkeypat
     assert t["metrics"]["n_commands"] == 4       # every relayed command is in our transcript
     manifest = json.loads(next((tmp_path / "home" / "artifacts").rglob("manifest.json")).read_text())
     assert manifest["pins"]["agent_image"] != manifest["pins"]["task_image"]
+
+
+ENV_CLI = r"""#!/usr/lib/phantom/bash.real
+cat > /dev/null
+sh -c 'definitely-not-a-command --version'   # rc 127 in the chamber
+printf '{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":0,"result":"ok"}\n'
+"""
+
+
+@pytest.mark.parametrize("benchmark,task,missing", [("bash-operations", "bash-001", ["bash"]),
+                                                     ("python-tasks", "py-001", [])])
+def test_env_check_flags_declared_expectations_the_chamber_lacks(root, tmp_path, monkeypatch, benchmark, task, missing):
+    """Alpine has no bash: flagged, not fixed (the task image is the experiment)."""
+    folder = tmp_path / "fake-env"
+    folder.mkdir()
+    (folder / "fakecli").write_text(ENV_CLI)
+    (folder / "install.Dockerfile").write_text("ARG BASE\nFROM ${BASE}\nCOPY fakecli /usr/local/bin/fakecli\n"
+                                               "RUN chmod +x /usr/local/bin/fakecli\n")
+    (folder / "agent.yaml").write_text("name: fake-env\nplacement: phantom\nexpects: [bash]\n"
+                                       "installed: {run: fakecli, output_parser: claude_stream_json}\n")
+    if benchmark == "bash-operations":
+        # alpine has no bash for the fake CLI's shebang inside the box either: give the box one
+        (folder / "install.Dockerfile").write_text("ARG BASE\nFROM ${BASE}\nRUN apk add --no-cache bash\n"
+                                                   "COPY fakecli /usr/local/bin/fakecli\nRUN chmod +x /usr/local/bin/fakecli\n")
+    monkeypatch.setenv("VALS_HOME", str(tmp_path / "home"))
+    paths = service.Paths.from_root(root)
+    run_id = service.submit(paths, RunSpec(agent=str(folder), benchmark=benchmark, task_ids=[task]))
+    service.work(paths, run_id=run_id)
+    s = summarize(Store(paths.db), run_id)
+    (t,) = s["trials"]
+    assert t["status"] == "graded", t
+    assert t["metrics"]["env"] == {"expects": ["bash"], "missing": missing}
+    assert t["metrics"]["n_not_found"] == 1
+    assert s["env"]["missing"] == ({"bash": 1} if missing else {})
+    assert s["env"]["commands_not_found"] == 1

@@ -59,8 +59,29 @@ def summarize(store: Store, run_id: str) -> dict[str, Any]:
         "cost_usd": round(cost, 4),
         "duration_s": round(max(finished) - min(started), 1) if done and started and finished else None,
         "tasks": [{"task_id": k, **v} for k, v in sorted(tasks.items())],
+        "env": _env_summary(rows),
         "trials": [_trial(r) for r in rows],
     }
+
+
+def _env_summary(rows: list[Any]) -> dict[str, Any]:
+    """Environment mismatches across the run: declared expectations the chamber didn't
+    meet, and commands that came back "not found" (rc 127)."""
+    missing: dict[str, int] = defaultdict(int)
+    checked = not_found = trials_not_found = 0
+    for r in rows:
+        if r["status"] != "graded":
+            continue
+        metrics = json.loads(r["metrics_json"] or "null") or {}
+        if env := metrics.get("env"):
+            checked += 1
+            for prog in env.get("missing", []):
+                missing[prog] += 1
+        n = metrics.get("n_not_found") or 0
+        not_found += n
+        trials_not_found += 1 if n else 0
+    return {"trials_checked": checked, "missing": dict(missing),
+            "commands_not_found": not_found, "trials_with_not_found": trials_not_found}
 
 
 def _trial(r: Any) -> dict[str, Any]:
