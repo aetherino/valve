@@ -1,8 +1,8 @@
 # mini-swe-agent: the fixed bash-only harness Vals uses for model evals.
-# Runs as a host subprocess in phase 1; becomes a sidecar image in phase 2 (same agent.py).
+# Runs in its own sidecar container (see Dockerfile); `placement: host` still works for dev.
 name: mini-swe-agent
 version: "2.4.6"
-placement: host
+placement: sidecar
 command: ["python", "agent.py"]
 secrets: [ANTHROPIC_API_KEY, ANTHROPIC_WORKSPACE_ID]   # workspace id only needed for unscoped keys
 defaults:

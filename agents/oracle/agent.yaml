@@ -1,5 +1,5 @@
-# Test agent (no model, $0). Runs as a host subprocess in phase 1; sidecar image in phase 2.
+# Test agent (no model, $0). Runs in its own sidecar container (default Dockerfile).
 name: oracle
 version: "1"
-placement: host
+placement: sidecar
 command: ["python", "agent.py"]

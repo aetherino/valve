@@ -35,3 +35,39 @@ def test_vandal_cannot_turn_its_failure_into_an_infra_error(root, tmp_path, monk
     s = summarize(Store(paths.db), run_id)
     assert s["counts"] == {"graded": len(s["trials"])}, s["trials"]
     assert s["accuracy"]["mean"] == 0.0
+
+
+def test_sidecar_agent_sees_nothing_of_the_host(root, tmp_path, monkeypatch):
+    """The agent process itself (not just its commands) is confined: no host files,
+    no worker environment, only its declared secrets."""
+    import json
+    import time
+
+    from test_protocol import FakeSandbox, ListRecorder
+
+    from vals_harness.chamber_api import ChamberApi
+    from vals_harness.launchers import DockerLauncher
+    from vals_harness.specs import AgentSpec
+
+    folder = tmp_path / "snoop"
+    folder.mkdir()
+    (folder / "agent.py").write_text(
+        "import json, os\n"
+        "from vals_agent_sdk.client import AgentClient\n"
+        "c = AgentClient('snoop', '1')\n"
+        "report = {'env': sorted(os.environ), 'repo_visible': os.path.exists(%r),\n"
+        "          'home_visible': os.path.exists(%r), 'declared': os.environ.get('VALS_TEST_SECRET')}\n"
+        "c.finish('submitted', message=json.dumps(report))\n" % (str(root), str(root.home())))
+    monkeypatch.setenv("VALS_TEST_SECRET", "s3cret")
+    monkeypatch.setenv("VALS_TEST_UNDECLARED", "nope")
+    spec = AgentSpec(name="snoop", placement="sidecar", command=["python", "agent.py"],
+                     secrets=["VALS_TEST_SECRET"], root=folder)
+    labels = {"vals.claim": "test-snoop"}
+    session = DockerLauncher().launch(spec, tmp_path / "stderr.log", labels)
+    api = ChamberApi(FakeSandbox(), ListRecorder(), trial_id="t", command_timeout_s=30)
+    outcome = api.serve(session, {"instruction": "x", "config": {}}, deadline=time.monotonic() + 60)
+    report = json.loads(outcome.message)
+    assert outcome.exit_status == "submitted"
+    assert report["declared"] == "s3cret"
+    assert "VALS_TEST_UNDECLARED" not in report["env"]
+    assert not report["repo_visible"] and not report["home_visible"]

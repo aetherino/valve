@@ -18,7 +18,7 @@ from typing import Any
 from vals_harness.benchmarks import BenchmarkAdapter
 from vals_harness.chamber_api import AgentOutcome, ChamberApi
 from vals_harness.errors import InfraError
-from vals_harness.launchers import AgentLauncher, HostLauncher
+from vals_harness.launchers import AgentLauncher, DockerLauncher, HostLauncher
 from vals_harness.sandbox import SandboxProvider
 from vals_harness.specs import TrialSpec
 from vals_harness.store import Claim, LostLease, Store
@@ -58,7 +58,7 @@ class TrialRunner:
         self.provider = provider
         self.store = store
         self.artifacts_root = artifacts_root
-        self.launchers = launchers or {"host": HostLauncher()}
+        self.launchers = launchers or {"host": HostLauncher(), "sidecar": DockerLauncher()}
 
     def run(self, claim: Claim) -> dict[str, Any]:
         """Run one try. Raises LostLease if another worker took the trial over."""
@@ -76,16 +76,20 @@ class TrialRunner:
             # 1 PREPARE
             self._phase(claim, rec, "preparing")
             bench = BenchmarkAdapter(spec.benchmark, self.provider)
+            launcher = self.launchers.get(spec.agent.placement)
+            if launcher is None:
+                raise InfraError("adapter", f"placement {spec.agent.placement!r} is not available yet")
+            # Images (task, tooling, agent) are resolved before any container starts,
+            # so a slow build never holds a chamber open, and all three get pinned.
             pins = {"task_image": self.provider.ensure_image(spec.task.image),
                     "tooling_image": bench.tooling_image()}
+            if agent_image := launcher.prepare(spec.agent):
+                pins["agent_image"] = agent_image
             self._write_manifest(spec, pins, folder)
             prepared = bench.prepare(spec.task, folder / "work", labels)
 
             # 2 CHAMBER + 3 AGENT + 4 COLLECT
             self._phase(claim, rec, "running_agent")
-            launcher = self.launchers.get(spec.agent.placement)
-            if launcher is None:
-                raise InfraError("adapter", f"placement {spec.agent.placement!r} is not available yet")
             t_agent = time.monotonic()
             # Created from the pinned image id, so the tag can't move under a running trial.
             with self.provider.create(pins["task_image"], labels={**labels, "vals.role": "chamber"},
@@ -94,7 +98,7 @@ class TrialRunner:
                 chamber.put_dir(prepared.visible_dir, WORKSPACE)
                 if spec.policy.expose_eval_files and any(prepared.eval_dir.iterdir()):
                     chamber.put_dir(prepared.eval_dir, WORKSPACE)
-                session = launcher.launch(spec.agent, folder / "agent_stderr.log")
+                session = launcher.launch(spec.agent, folder / "agent_stderr.log", labels)
                 api = ChamberApi(chamber, rec, trial_id=spec.trial_id,
                                  command_timeout_s=spec.limits.command_timeout_s)
                 outcome = api.serve(session, self._start_payload(spec),

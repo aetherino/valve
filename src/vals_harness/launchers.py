@@ -1,24 +1,44 @@
 """AgentLauncher: start an agent for a trial and hand back a session (DESIGN.md §5.3).
 
 The worker never assumes the agent is a local process; it only talks to an
-AgentSession (a transport + wait/kill). v1: HostLauncher (dev). Phase 2 adds
-DockerLauncher (`docker run -i`, same stdio transport); later RemoteLauncher.
+AgentSession (a transport + wait/kill). Both launchers speak the same stdio
+transport; only how the process is started differs:
+  HostLauncher    agent runner as a host subprocess (dev only)
+  DockerLauncher  agent runner in its own container via `docker run -i` (sidecar, default)
+A RemoteLauncher would hand back a WebSocket transport instead.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
+import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
 from vals_harness.errors import InfraError
 from vals_harness.protocol import StdioTransport, Transport
+from vals_harness.sandbox.docker import HARDENING, _docker
 from vals_harness.specs import AgentSpec
 
 SRC_DIR = Path(__file__).resolve().parents[1]  # .../src, so agents can import vals_agent_sdk
+SDK_DIR = SRC_DIR / "vals_agent_sdk"
+
+# Used for agents whose folder has no Dockerfile: Python + the SDK + the agent folder.
+DEFAULT_AGENT_DOCKERFILE = """\
+FROM python:3.11-slim
+COPY vals_agent_sdk /opt/vals/vals_agent_sdk
+ENV PYTHONPATH=/opt/vals PYTHONUNBUFFERED=1
+WORKDIR /agent
+COPY agent/ /agent/
+"""
+
+AGENT_CPUS = "1"
+AGENT_MEMORY = "2g"
 
 
 class AgentSession(Protocol):
@@ -32,13 +52,20 @@ class AgentSession(Protocol):
 
 
 class AgentLauncher(Protocol):
-    def launch(self, agent: AgentSpec, stderr_path: Path) -> AgentSession: ...
+    def prepare(self, agent: AgentSpec) -> str | None:
+        """Get everything ready before any chamber exists (e.g. build the image).
+        Returns an id to pin in the manifest, if there is one."""
+        ...
+
+    def launch(self, agent: AgentSpec, stderr_path: Path, labels: dict[str, str]) -> AgentSession: ...
 
 
 @dataclass
 class ProcessSession:
     proc: subprocess.Popen[bytes]
     transport: Transport
+    container: str | None = None   # for sidecars: killing the docker client doesn't stop the container
+    _killed: bool = field(default=False, repr=False)
 
     def wait(self, timeout: float) -> int | None:
         try:
@@ -47,10 +74,23 @@ class ProcessSession:
             return None
 
     def kill(self) -> None:
+        if self.container and not self._killed:
+            _docker(["rm", "-f", self.container], check=False, timeout=60)
+        self._killed = True
         if self.proc.poll() is None:
             self.proc.kill()
             self.proc.wait()
         self.transport.close()
+
+
+def _start(argv: list[str], *, cwd: Path | None, env: dict[str, str], stderr_path: Path,
+           name: str) -> subprocess.Popen[bytes]:
+    with open(stderr_path, "wb") as stderr:  # the child keeps its own copy of the fd
+        try:
+            return subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, stderr=stderr)
+        except OSError as e:
+            raise InfraError("adapter", f"could not start agent {name}: {e}") from e
 
 
 class HostLauncher:
@@ -60,7 +100,10 @@ class HostLauncher:
     secrets, not the worker's whole environment.
     """
 
-    def launch(self, agent: AgentSpec, stderr_path: Path) -> AgentSession:
+    def prepare(self, agent: AgentSpec) -> str | None:
+        return None
+
+    def launch(self, agent: AgentSpec, stderr_path: Path, labels: dict[str, str]) -> AgentSession:
         argv = [sys.executable if a == "python" else a for a in agent.command]
         env = {k: os.environ[k] for k in ("PATH", "HOME", "LANG", "TMPDIR") if k in os.environ}
         env["PYTHONPATH"] = str(SRC_DIR)
@@ -68,11 +111,63 @@ class HostLauncher:
         for name in agent.secrets:
             if name in os.environ:
                 env[name] = os.environ[name]
-        with open(stderr_path, "wb") as stderr:  # the child keeps its own copy of the fd
-            try:
-                proc = subprocess.Popen(argv, cwd=agent.root, env=env, stdin=subprocess.PIPE,
-                                        stdout=subprocess.PIPE, stderr=stderr)
-            except OSError as e:
-                raise InfraError("adapter", f"could not start agent {agent.name}: {e}") from e
+        proc = _start(argv, cwd=agent.root, env=env, stderr_path=stderr_path, name=agent.name)
         assert proc.stdin and proc.stdout
         return ProcessSession(proc, StdioTransport(proc.stdout, proc.stdin))
+
+
+class DockerLauncher:
+    """Runs the agent runner in its own hardened container (the sidecar).
+
+    The container gets the agent's code, its declared secrets and network egress
+    for model calls; it has no mounts and no route to the chamber or the worker
+    other than its own stdin/stdout.
+    """
+
+    def __init__(self) -> None:
+        self._images: dict[str, str] = {}
+
+    def image_for(self, agent: AgentSpec) -> str:
+        """Build the agent image once per content hash of (agent folder + SDK)."""
+        if agent.name in self._images:
+            return self._images[agent.name]
+        dockerfile = agent.root / "Dockerfile"
+        recipe = dockerfile.read_bytes() if dockerfile.exists() else DEFAULT_AGENT_DOCKERFILE.encode()
+        h = hashlib.sha256(recipe)
+        for base in (agent.root, SDK_DIR):
+            for f in sorted(p for p in base.rglob("*") if p.is_file() and "__pycache__" not in p.parts):
+                h.update(str(f.relative_to(base)).encode() + b"\0" + f.read_bytes())
+        tag = f"vals/agent-{agent.name}:{h.hexdigest()[:12]}"
+        if _docker(["image", "inspect", tag], check=False).returncode != 0:
+            with tempfile.TemporaryDirectory(prefix="vals-agent-build-") as ctx:
+                # Build context = the agent folder + the SDK, nothing else from the repo.
+                shutil.copytree(agent.root, Path(ctx) / "agent",
+                                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".env*"))
+                shutil.copytree(SDK_DIR, Path(ctx) / "vals_agent_sdk", ignore=shutil.ignore_patterns("__pycache__"))
+                (Path(ctx) / "Dockerfile").write_bytes(recipe)
+                _docker(["build", "-q", "-t", tag, ctx], timeout=1200, kind="image")
+        self._images[agent.name] = tag
+        return tag
+
+    def prepare(self, agent: AgentSpec) -> str | None:
+        tag = self.image_for(agent)
+        return _docker(["image", "inspect", "--format", "{{.Id}}", tag]).stdout.decode().strip()
+
+    def launch(self, agent: AgentSpec, stderr_path: Path, labels: dict[str, str]) -> AgentSession:
+        image = self.image_for(agent)
+        name = f"vals-agent-{labels.get('vals.claim', os.urandom(6).hex())[:12]}"
+        argv = ["docker", "run", "-i", "--rm", "--name", name, "--label", "vals.managed=1",
+                "--label", "vals.role=agent"]
+        for k, v in labels.items():
+            argv += ["--label", f"{k}={v}"]
+        argv += [*HARDENING, "--cpus", AGENT_CPUS, "--memory", AGENT_MEMORY, "--network", "bridge"]
+        # `-e NAME` (no value) makes docker read the value from its own environment, so
+        # secrets never appear in this command line (or in `ps`).
+        env = dict(os.environ)
+        for secret in agent.secrets:
+            if secret in os.environ:
+                argv += ["-e", secret]
+        argv += ["-w", "/agent", image, *agent.command]
+        proc = _start(argv, cwd=None, env=env, stderr_path=stderr_path, name=agent.name)
+        assert proc.stdin and proc.stdout
+        return ProcessSession(proc, StdioTransport(proc.stdout, proc.stdin), container=name)

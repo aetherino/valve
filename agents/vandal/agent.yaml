@@ -2,5 +2,5 @@
 # which would drop it from the accuracy denominator. Expect 0% and no infra errors.
 name: vandal
 version: "1"
-placement: host
+placement: sidecar
 command: ["python", "agent.py"]

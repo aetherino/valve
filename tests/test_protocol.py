@@ -55,7 +55,7 @@ def _serve(tmp_path: Path, body: str, timeout_s: float = 20, output_bytes: int =
     (folder / "agent.py").write_text("from vals_agent_sdk.client import AgentClient\n" + textwrap.dedent(body))
     spec = AgentSpec(name="t", placement="host", command=["python", "agent.py"], root=folder)
     sb, rec = FakeSandbox(output_bytes), ListRecorder()
-    session = HostLauncher().launch(spec, tmp_path / "stderr.log")
+    session = HostLauncher().launch(spec, tmp_path / "stderr.log", {})
     api = ChamberApi(sb, rec, trial_id="trial-1", command_timeout_s=30)
     start = {"instruction": "do it", "config": {"model": "m"}, "task": {"id": "t1"}, "workspace": "/workspace"}
     outcome = api.serve(session, start, deadline=time.monotonic() + timeout_s)

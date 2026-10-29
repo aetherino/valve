@@ -458,8 +458,8 @@ harness worker [--once]            # --slots N in phase 3
 harness cancel --run_id ID
 ```
 
-1. `Sandbox` (Docker) + both benchmark adapters + mini-swe-agent on `host` placement + `run --wait` + SQLite + results. Fastest path to end-to-end.
-2. Chamber API + mini-swe-agent agent image (`api` bridge); sidecar becomes the default.
+1. ✅ `Sandbox` (Docker) + both benchmark adapters + mini-swe-agent on `host` placement + `run --wait` + SQLite + results.
+2. ✅ `DockerLauncher`: every agent runs in its own sidecar container (`docker run -i`, same stdio protocol). Agent images are built in PREPARE from the agent folder + SDK (default Dockerfile, or the agent's own), tagged by content hash, and pinned by id in the manifest. Secrets passed as `-e NAME` (never on the command line); the container has no mounts, egress for model calls, the standard hardening, and is removed by name on kill.
 3. Queue, workers, leases, `status`.
 4. Claude Code, installed (Harbor pattern).
 5. Stretch: Claude Code via `shell_relay` (spike first), model proxy, network lockdown.
@@ -482,7 +482,7 @@ Built-in test agents make the whole pipeline testable deterministically at $0 mo
 - **cheater** — tries every grading attack found so far: recon for tests, a fake `test_solution.py`, a planted `pytest.py` and `conftest.py`, a submission that calls `os._exit(0)` at import, absolute / escaping / overlay-redirect symlinks, and Docker's error text in its output. Expect 0% and no infra errors.
 - **vandal** — tries to turn its own failure into an infra error: malformed protocol messages, garbage `finish` numbers, `rm -rf /workspace`. Expect 0% and no infra errors.
 
-They run as host agents in phase 1 (sidecar images in phase 2). Unit tests cover specs, parsers, graded-workspace safety, the protocol (malformed params, an agent that stops reading), the store (fencing, retry caps, spend) and aggregation; integration tests run every test agent against both benchmarks in real Docker.
+They run as sidecar containers like any other agent; a further integration test proves a sidecar agent sees no host files, none of the worker's environment, and only its declared secrets. Unit tests cover specs, parsers, graded-workspace safety, the protocol (malformed params, an agent that stops reading), the store (fencing, retry caps, spend) and aggregation; integration tests run every test agent against both benchmarks in real Docker.
 
 ## 14. Repo layout and image builds
 
