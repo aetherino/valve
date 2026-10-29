@@ -7,7 +7,8 @@ retried and excluded from accuracy.
 
 from typing import Literal
 
-InfraKind = Literal["image", "docker", "prepare", "verifier", "adapter", "protocol", "timeout_harness"]
+InfraKind = Literal["image", "docker", "prepare", "verifier", "adapter", "protocol", "timeout_harness",
+                    "config", "model_api"]
 
 
 class InfraError(Exception):
@@ -18,3 +19,9 @@ class InfraError(Exception):
 
     def to_dict(self) -> dict[str, str]:
         return {"kind": self.kind, "message": self.message}
+
+
+class ChamberStopped(Exception):
+    """The sandbox stopped from the inside (e.g. `kill 1`, `pkill tail`, OOM), not
+    because the harness or Docker failed. In the chamber that is the agent's doing:
+    no more commands are served, but the workspace is still snapshotted and graded."""

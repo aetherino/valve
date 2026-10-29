@@ -44,7 +44,10 @@ def run(agent: str, benchmark: str, task_ids: str | None, model: str | None, att
         model=model, attempts=attempts, limits=_parse_limits(limits),
         policy=Policy(expose_eval_files=expose_eval_files),
     )
-    run_id = service.submit(paths, spec)
+    try:
+        run_id = service.submit(paths, spec)
+    except ValueError as e:   # unknown task ids, missing secrets: nothing was queued
+        raise click.ClickException(str(e)) from e
     click.echo(f"run_id: {run_id}")
     if not wait:
         click.echo("queued. start a worker with `harness worker`, then `harness status --run_id " + run_id + "`")

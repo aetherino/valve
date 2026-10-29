@@ -106,7 +106,7 @@ def work(paths: Paths, *, slots: int = 1, run_id: str | None = None, stop_when_e
     worker_id = f"{socket.gethostname()}:{os.getpid()}"
     jobs_dir = paths.home / "jobs"
     jobs_dir.mkdir(parents=True, exist_ok=True)
-    provider.reap_stale(store.live_claims())  # leftovers from workers that died
+    provider.reap_stale(store.live_claims(), store.home_id)  # leftovers from this home's dead workers
     running: dict[str, _Running] = {}
     last_heartbeat = time.monotonic()
 
@@ -231,7 +231,8 @@ def prune(paths: Paths, *, dry_run: bool = False) -> dict[str, list[str] | int]:
     containers = 0
     refused: list[str] = []
     if not dry_run:
-        containers = DockerSandboxProvider().reap_stale(Store(paths.db).live_claims())
+        store = Store(paths.db)
+        containers = DockerSandboxProvider().reap_stale(store.live_claims(), store.home_id)
         refused = remove_images(stale)
     return {"kept": sorted(keep), "removed": [i for i in stale if i not in refused], "refused": refused,
             "containers_removed": containers}

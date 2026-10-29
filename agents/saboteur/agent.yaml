@@ -1,0 +1,6 @@
+# Test agent (no model, $0): stops its own chamber and the grader's sandbox from the
+# inside. Expect 0% and no infra errors, with its reported spend kept.
+name: saboteur
+version: "1"
+placement: sidecar
+command: ["python", "agent.py"]

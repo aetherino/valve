@@ -12,13 +12,14 @@ import math
 import threading
 import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from vals_harness.errors import InfraError
+from vals_harness.errors import ChamberStopped, InfraError
 from vals_harness.launchers import AgentSession
-from vals_harness.protocol import (CANCELLED, CHAMBER_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND,
-                                   NOT_FOUND, PROTOCOL, ProtocolError, TransportClosed, error,
-                                   notification, result)
+from vals_harness.protocol import (CANCELLED, CHAMBER_ERROR, CHAMBER_STOPPED, INVALID_PARAMS,
+                                   METHOD_NOT_FOUND, NOT_FOUND, PROTOCOL, ProtocolError,
+                                   TransportClosed, error, notification, result)
 from vals_harness.sandbox import Sandbox
 
 HELLO_TIMEOUT_S = 30
@@ -26,8 +27,25 @@ CANCEL_GRACE_S = 10
 EXIT_GRACE_S = 10
 WATCHDOG_SLACK_S = 5   # past deadline + grace, the agent process is killed unconditionally
 WORKSPACE = "/workspace"
+# `docker run` itself failed before the agent said hello (125: daemon error / name
+# conflict, 126: cannot invoke, 127: not found). Before hello the agent hasn't seen the
+# task, so treating these as harness failures can't be used to dodge a hard task.
+LAUNCH_FAILURE_CODES = (125, 126, 127)
 
-ExitStatus = Literal["submitted", "step_limit", "cost_limit", "timeout", "agent_error", "gave_up"]
+# "model_error": the agent's adapter reports that its model provider failed (auth, rate
+# limit, overload, unknown model). Honoured as an infra error (kind model_api) only if
+# the agent never touched the chamber; otherwise it becomes agent_error (see serve()).
+ExitStatus = Literal["submitted", "step_limit", "cost_limit", "timeout", "agent_error", "gave_up", "model_error"]
+EXIT_STATUSES = {"submitted", "step_limit", "cost_limit", "timeout", "agent_error", "gave_up", "model_error"}
+
+
+def safe_num(value: Any, cast: type) -> Any:
+    """Agent-reported numbers are untrusted: anything malformed, negative or non-finite is 0."""
+    try:
+        v = cast(value or 0)
+        return v if math.isfinite(v) and v >= 0 else cast(0)
+    except (TypeError, ValueError, OverflowError):
+        return cast(0)
 
 
 @dataclass
@@ -50,6 +68,7 @@ class Recorder(Protocol):
     def event(self, type: str, payload: dict[str, Any]) -> None: ...
     def transcript(self, entry: dict[str, Any]) -> None: ...
     def artifact(self, name: str, data: bytes) -> None: ...
+    def artifact_path(self, name: str) -> Path: ...   # for artifacts streamed to disk
 
 
 class ChamberApi:
@@ -60,6 +79,7 @@ class ChamberApi:
         self.command_timeout_s = command_timeout_s
         self.n_commands = 0
         self._cancelling = False
+        self._hello_done = False
         self._watchdog_fired = threading.Event()
 
     # ------------------------------------------------------------------ session
@@ -84,6 +104,10 @@ class ChamberApi:
             t.send(notification("start", start))
             outcome = self._loop(session, deadline)
         except TransportClosed as e:
+            if not self._hello_done and (rc := session.wait(5)) in LAUNCH_FAILURE_CODES:
+                watchdog.cancel()
+                raise InfraError("adapter", f"agent container failed to start (docker exit {rc}); "
+                                            "see agent_stderr.log") from e
             outcome = AgentOutcome("agent_error", message=f"agent exited without finish: {e}")
         except ProtocolError as e:
             outcome = AgentOutcome("agent_error", message=f"protocol violation: {e}")
@@ -94,8 +118,14 @@ class ChamberApi:
             else:
                 session.transport.close()
         if self._watchdog_fired.is_set():
-            outcome = AgentOutcome("timeout", message="agent killed at the wall-clock limit")
+            # Keep any numbers the agent reported (a finish during the grace period).
+            outcome.exit_status, outcome.message = "timeout", "agent killed at the wall-clock limit"
         outcome.n_commands = self.n_commands
+        if outcome.exit_status == "model_error" and self.n_commands:
+            # Once the agent has acted on the chamber, a claimed provider failure could be a
+            # way to drop a failing trial from the accuracy denominator: graded instead.
+            outcome.exit_status = "agent_error"
+            outcome.message = f"model_error after {self.n_commands} command(s): {outcome.message}"[:2000]
         self.rec.event("agent_finished", outcome.to_dict())
         return outcome
 
@@ -112,6 +142,7 @@ class ChamberApi:
             # The agent's adapter is wrong: an agent failure (graded 0), not the harness's.
             session.transport.send(error(msg.get("id"), INVALID_PARAMS, f"unsupported protocol {theirs!r}"))
             raise ProtocolError(f"agent speaks {theirs!r}, we speak {PROTOCOL!r}")
+        self._hello_done = True
         self.rec.event("agent_hello", {"agent": params.get("agent", {}),
                                        "capabilities": params.get("capabilities", [])})
         session.transport.send(result(msg.get("id"), {"protocol": PROTOCOL, "trial_id": self.trial_id}))
@@ -131,23 +162,37 @@ class ChamberApi:
                 return done
 
     def _cancel(self, session: AgentSession) -> AgentOutcome:
-        """Deadline passed: ask nicely, give a short grace period to `finish`, then kill.
+        """Deadline passed. The agent's reported numbers (tokens, cost) are kept if it
+        finishes during the grace period: that spend is real."""
+        outcome = self._wind_down(session, "deadline") or AgentOutcome("timeout")
+        outcome.exit_status, outcome.message = "timeout", "agent wall-clock limit reached"
+        return outcome
 
-        During the grace period the agent may only report (finish / event / artifact);
-        it can't keep working on the chamber.
-        """
+    def _chamber_stopped(self, session: AgentSession, e: ChamberStopped) -> AgentOutcome:
+        """The agent stopped its own chamber (`kill 1` ...): nothing left to serve. The
+        session ends like a cancel; the workspace is still snapshotted and graded."""
+        self.rec.event("chamber_stopped", {"reason": str(e)})
+        outcome = self._wind_down(session, "chamber_stopped") or AgentOutcome("agent_error")
+        outcome.exit_status, outcome.message = "agent_error", f"agent stopped its chamber: {e}"
+        return outcome
+
+    def _wind_down(self, session: AgentSession, reason: str) -> AgentOutcome | None:
+        """Send `cancel`, give a short grace period to `finish`, then kill. During the
+        grace period the agent may only report (finish / event / artifact); it can't keep
+        working on the chamber. Returns the agent's finish, if it sent one."""
         self._cancelling = True
+        finished = None
         try:
-            session.transport.send(notification("cancel", {"reason": "deadline"}))
+            session.transport.send(notification("cancel", {"reason": reason}))
             grace_end = time.monotonic() + CANCEL_GRACE_S
             while (left := grace_end - time.monotonic()) > 0:
                 msg = session.transport.recv(timeout=left)
-                if self._dispatch(session, msg) is not None:
+                if (finished := self._dispatch(session, msg)) is not None:
                     break
         except (TimeoutError, TransportClosed, ProtocolError):
             pass
         session.kill()
-        return AgentOutcome("timeout", message="agent wall-clock limit reached")
+        return finished
 
     # ------------------------------------------------------------------ dispatch
 
@@ -179,6 +224,9 @@ class ChamberApi:
         except InfraError:
             t.send(error(id_, CHAMBER_ERROR, "chamber unavailable"))
             raise
+        except ChamberStopped as e:
+            t.send(error(id_, CHAMBER_STOPPED, f"chamber stopped: {e}"))
+            return self._chamber_stopped(session, e)
         except FileNotFoundError as e:
             t.send(error(id_, NOT_FOUND, str(e)))
         except Exception as e:  # anything else the agent sent us is its problem, not ours
@@ -233,20 +281,12 @@ class ChamberApi:
     @staticmethod
     def _outcome_from(p: dict[str, Any]) -> AgentOutcome:
         """Agent-reported numbers are untrusted: anything malformed becomes 0, never a crash."""
-        def num(key: str, cast: type) -> Any:
-            try:
-                v = cast(p.get(key) or 0)
-                return v if math.isfinite(v) and v >= 0 else cast(0)
-            except (TypeError, ValueError, OverflowError):
-                return cast(0)
-
         status = p.get("exit_status")
-        allowed = {"submitted", "step_limit", "cost_limit", "timeout", "agent_error", "gave_up"}
         return AgentOutcome(
-            exit_status=status if status in allowed else "agent_error",
-            steps=num("steps", int),
-            input_tokens=num("input_tokens", int),
-            output_tokens=num("output_tokens", int),
-            cost_usd=num("cost_usd", float),
+            exit_status=status if isinstance(status, str) and status in EXIT_STATUSES else "agent_error",
+            steps=safe_num(p.get("steps"), int),
+            input_tokens=safe_num(p.get("input_tokens"), int),
+            output_tokens=safe_num(p.get("output_tokens"), int),
+            cost_usd=safe_num(p.get("cost_usd"), float),
             message=str(p.get("message") or "")[:2000],
         )

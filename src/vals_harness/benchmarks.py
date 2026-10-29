@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from vals_harness.errors import InfraError
+from vals_harness.errors import ChamberStopped, InfraError
 from vals_harness.sandbox import ExecResult, SandboxProvider
 from vals_harness.specs import BenchmarkSpec, Task
 
@@ -100,8 +100,11 @@ class BenchmarkAdapter:
 
         with self.provider.create(self.tooling_image(), labels={**labels, "vals.role": "tooling"}) as sb:
             sb.put_dir(self.spec.root, BENCH_DIR)
-            r = sb.exec(self._argv(self.spec.prepare, task, out=OUT_DIR),
-                        timeout=PREPARE_TIMEOUT_S, cwd=BENCH_DIR)
+            try:
+                r = sb.exec(self._argv(self.spec.prepare, task, out=OUT_DIR),
+                            timeout=PREPARE_TIMEOUT_S, cwd=BENCH_DIR)
+            except ChamberStopped as e:   # the benchmark's own script, not the agent
+                raise InfraError("prepare", str(e)) from e
             if r.returncode != 0:
                 raise InfraError("prepare", f"exit {r.returncode}: {r.output[-2000:]}")
             sb.get_dir(OUT_DIR, visible)
@@ -128,8 +131,14 @@ class BenchmarkAdapter:
         with self.provider.create(self.tooling_image(), labels={**labels, "vals.role": "verifier"}) as sb:
             sb.put_dir(self.spec.root, BENCH_DIR)
             sb.put_dir(graded_ws, WORKSPACE)
-            r = sb.exec(self._argv(self.spec.verify, task, workspace=WORKSPACE),
-                        timeout=timeout, cwd=BENCH_DIR)
+            try:
+                r = sb.exec(self._argv(self.spec.verify, task, workspace=WORKSPACE),
+                            timeout=timeout, cwd=BENCH_DIR)
+            except ChamberStopped as e:
+                # The submission runs inside the grader (pytest imports it) and stopped the
+                # verifier (e.g. os.kill(1, SIGTERM) at import): the agent's failure.
+                harness = {"skipped_files": skipped} if skipped else {}
+                return Grade(False, 0.0, {"harness": {**harness, "error": f"submission stopped the grader: {e}"}}), None
         harness = {"skipped_files": skipped} if skipped else {}
         if r.timed_out:
             # The submission runs inside the grader (e.g. pytest imports it), so a hang

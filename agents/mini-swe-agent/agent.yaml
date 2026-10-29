@@ -4,7 +4,8 @@ name: mini-swe-agent
 version: "2.4.6"
 placement: sidecar
 command: ["python", "agent.py"]
-secrets: [ANTHROPIC_API_KEY, ANTHROPIC_WORKSPACE_ID]   # workspace id only needed for unscoped keys
+secrets: [ANTHROPIC_API_KEY]                 # required: submit refuses the run if unset
+optional_secrets: [ANTHROPIC_WORKSPACE_ID]   # only needed for unscoped keys
 defaults:
   model: anthropic/claude-opus-5-5   # litellm model string
   step_limit: 50

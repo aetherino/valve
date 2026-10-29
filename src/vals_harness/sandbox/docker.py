@@ -3,18 +3,24 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import json
 import os
+import tarfile
 import subprocess
 import threading
 import time
 from pathlib import Path
 
-from vals_harness.errors import InfraError
+from vals_harness.errors import ChamberStopped, InfraError
 from vals_harness.sandbox import ExecResult
 
 MAX_OUTPUT_BYTES = 1_000_000        # per exec, returned to the agent
 MAX_FILE_BYTES = 10_000_000         # per `get`
 MAX_SNAPSHOT_BYTES = 1_000_000_000  # final workspace tar
+MAX_STREAM_BYTES = 50_000_000       # exec with stdout_path (an installed CLI's stream-json)
+PULL_TIMEOUT_S = 600                # image builds/pulls; their sum must fit specs.PREPARE_SLACK_S
+TOOLING_BUILD_TIMEOUT_S = 900
 CLIENT_GRACE_S = 5                  # extra time for the docker client on top of the in-container timeout
 READ_CHUNK = 65536
 
@@ -76,6 +82,17 @@ def _run_capped(argv: list[str], *, timeout: float, cap: int, stdin: bytes | Non
     buf = bytearray()
     total = 0
     out_file = open(sink, "wb") if sink else None
+    err_buf = bytearray()
+    drain = None
+    if sink is not None:
+        # Drain stderr concurrently: a full stderr pipe must never stall the stdout stream.
+        def _drain() -> None:
+            assert proc.stderr
+            while chunk := proc.stderr.read1(READ_CHUNK):  # type: ignore[attr-defined]
+                if len(err_buf) < 4096:
+                    err_buf.extend(chunk[:4096 - len(err_buf)])
+        drain = threading.Thread(target=_drain, daemon=True)
+        drain.start()
     try:
         assert proc.stdout
         while chunk := proc.stdout.read1(READ_CHUNK):  # type: ignore[attr-defined]
@@ -92,8 +109,9 @@ def _run_capped(argv: list[str], *, timeout: float, cap: int, stdin: bytes | Non
         timer.cancel()
         if out_file:
             out_file.close()
-        if sink is not None and proc.stderr:
-            buf += proc.stderr.read()[:4096]
+        if drain is not None:
+            drain.join(timeout=5)
+            buf += err_buf
     return bytes(buf), rc, killed.is_set(), total > cap
 
 
@@ -106,19 +124,60 @@ class DockerSandbox:
         # The shell is a property of the image, decided here once for every agent.
         self.shell = ["bash", "-lc"] if "bash" in found else ["sh", "-c"]
         self._has_timeout = "timeout" in found
+        self._halted = False                    # the harness stopped it on purpose
+        self.stopped_inside: str | None = None  # why it stopped from the inside, once known
 
     def alive(self) -> bool:
         """Ask Docker, never the command output (which the agent controls)."""
         r = _docker(["inspect", "-f", "{{.State.Running}}", self.id], check=False, timeout=30)
         return r.returncode == 0 and r.stdout.strip() == b"true"
 
+    def exists(self) -> bool:
+        return _docker(["inspect", "-f", "{{.Id}}", self.id], check=False, timeout=30).returncode == 0
+
+    def _stopped(self, what: str) -> ChamberStopped:
+        """The container is not running: decide whose fault that is, from Docker's own records.
+
+        Stopped from the inside (an agent's `kill 1`, `pkill tail`, `kill -9 -1`, or its
+        processes blowing the memory limit) -> ChamberStopped, returned for the caller to
+        raise (the agent's failure). Removed, stopped through the Docker API (`docker stop`,
+        a daemon shutting down: a `kill`/`stop` event), stopped by the harness, or a daemon
+        we can't ask -> InfraError, raised here.
+        """
+        if self.stopped_inside:
+            return ChamberStopped(self.stopped_inside)
+        r = _docker(["inspect", "-f", "{{json .State}}", self.id], check=False, timeout=30)
+        if r.returncode != 0:
+            raise InfraError("docker", f"sandbox vanished during {what}: {r.stderr.decode(errors='replace').strip()}")
+        try:
+            state = json.loads(r.stdout)
+        except json.JSONDecodeError as e:
+            raise InfraError("docker", f"unreadable sandbox state after {what}") from e
+        if self._halted or state.get("Status") != "exited" or state.get("ExitCode") == 255:
+            raise InfraError("docker", f"sandbox stopped during {what} (state {state.get('Status')}, "
+                                       f"exit {state.get('ExitCode')})")
+        if not state.get("OOMKilled"):
+            # Docker records API-initiated stops as kill/stop events; a process inside the
+            # container killing PID 1 leaves only `die`.
+            ev = _docker(["events", "--since", "0", "--until", f"{time.time():.3f}",
+                          "--filter", f"container={self.id}", "--filter", "event=kill",
+                          "--filter", "event=stop", "--format", "{{.Action}}"], check=False, timeout=30)
+            if ev.returncode != 0 or ev.stdout.strip():
+                raise InfraError("docker", f"sandbox stopped through the Docker API during {what}")
+        why = "out of memory" if state.get("OOMKilled") else f"init exited with {state.get('ExitCode')}"
+        self.stopped_inside = f"sandbox stopped from the inside during {what} ({why})"
+        return ChamberStopped(self.stopped_inside)
+
     # -------------------------------------------------------------- commands
 
     def exec(self, cmd: str, *, timeout: int, cwd: str = "/workspace",
              env: dict[str, str] | None = None, stdin: bytes | None = None,
-             secret_env: dict[str, str] | None = None) -> ExecResult:
+             secret_env: dict[str, str] | None = None, stdout_path: Path | None = None) -> ExecResult:
         """`secret_env` values travel through the docker CLI's own environment
-        (`-e NAME`), so they never appear on a command line or in `ps`."""
+        (`-e NAME`), so they never appear on a command line or in `ps`. With
+        `stdout_path`, stdout streams to that host file (capped at MAX_STREAM_BYTES)."""
+        if self.stopped_inside:
+            raise ChamberStopped(self.stopped_inside)
         args = ["exec"] + (["-i"] if stdin is not None else []) + ["-w", cwd]
         for k, v in (env or {}).items():
             args += ["-e", f"{k}={v}"]
@@ -131,13 +190,14 @@ class DockerSandbox:
 
         start = time.monotonic()
         out, rc, killed, truncated = _run_capped(["docker", *args], timeout=timeout + CLIENT_GRACE_S,
-                                                 cap=MAX_OUTPUT_BYTES, stdin=stdin,
+                                                 cap=MAX_STREAM_BYTES if stdout_path else MAX_OUTPUT_BYTES,
+                                                 stdin=stdin, sink=stdout_path,
                                                  env={**os.environ, **secret_env} if secret_env else None)
         duration = time.monotonic() - start
-        # A non-zero exit is normally the agent's command failing. Only if Docker says
-        # the container is gone is it the harness's problem.
+        # A non-zero exit is normally the agent's command failing. If the container is
+        # no longer running, Docker's records decide whose fault it is (_stopped).
         if rc != 0 and not self.alive():
-            raise InfraError("docker", f"chamber stopped during exec (rc={rc})")
+            raise self._stopped("exec")
         return ExecResult(
             output=out.decode("utf-8", errors="replace"),
             returncode=-1 if killed else rc,
@@ -149,24 +209,49 @@ class DockerSandbox:
     # -------------------------------------------------------------- files
 
     def put(self, path: str, data: bytes) -> None:
+        if self.stopped_inside:
+            raise ChamberStopped(self.stopped_inside)
         script = 'mkdir -p "$(dirname -- "$1")" && cat > "$1"'
         out, rc, _, _ = _run_capped(["docker", "exec", "-i", self.id, "sh", "-c", script, "sh", path],
                                     timeout=60, cap=4096, stdin=data)
         if rc != 0:
             if not self.alive():
-                raise InfraError("docker", "chamber stopped during put")
+                raise self._stopped("put")
             raise ValueError(f"cannot write {path}: {out.decode(errors='replace').strip()}")
 
     def get(self, path: str) -> bytes:
+        """Read one file. Works on a stopped sandbox too (via `docker cp`)."""
+        if self.stopped_inside or self._halted:
+            return self._get_stopped(path)
         out, rc, _, truncated = _run_capped(["docker", "exec", self.id, "cat", "--", path],
                                             timeout=60, cap=MAX_FILE_BYTES)
         if rc != 0:
             if not self.alive():
-                raise InfraError("docker", "chamber stopped during get")
+                self._stopped("get")    # raises InfraError unless it stopped from the inside
+                return self._get_stopped(path)
             raise FileNotFoundError(f"{path}: {out.decode(errors='replace').strip()}")
         if truncated:
             raise ValueError(f"{path} is larger than {MAX_FILE_BYTES} bytes")
         return out
+
+    def _get_stopped(self, path: str) -> bytes:
+        tar, rc, _, truncated = _run_capped(["docker", "cp", f"{self.id}:{path}", "-"], timeout=60,
+                                            cap=MAX_FILE_BYTES + 1_000_000)
+        if rc != 0:
+            if not self.exists():
+                raise InfraError("docker", "sandbox vanished during get")
+            raise FileNotFoundError(f"{path}: {tar.decode(errors='replace').strip()}")
+        if truncated:
+            raise ValueError(f"{path} is larger than {MAX_FILE_BYTES} bytes")
+        try:
+            with tarfile.open(fileobj=io.BytesIO(tar)) as t:
+                member = t.next()
+                f = t.extractfile(member) if member is not None and member.isfile() else None
+                if f is None:
+                    raise FileNotFoundError(f"{path}: not a regular file")
+                return f.read()
+        except tarfile.TarError as e:
+            raise FileNotFoundError(f"{path}: {e}") from e
 
     def put_dir(self, local_dir: Path, dest: str) -> None:
         _docker(["exec", self.id, "mkdir", "-p", dest])
@@ -191,6 +276,15 @@ class DockerSandbox:
 
     # -------------------------------------------------------------- lifecycle
 
+    def halt(self) -> None:
+        """Kill every process in the sandbox, keep its filesystem (docker cp still works).
+
+        Used before the final snapshot, so nothing the agent left running (busybox
+        `timeout` leaves grandchildren) keeps writing while the workspace is copied out.
+        """
+        self._halted = True
+        _docker(["kill", self.id], check=False, timeout=60)
+
     def stop(self) -> None:
         try:
             _docker(["rm", "-f", "-v", self.id], check=False)
@@ -211,7 +305,7 @@ class DockerSandboxProvider:
         assert image is not None
         found = _docker(["image", "inspect", "--format", "{{.Id}}", image], check=False)
         if found.returncode != 0:
-            _docker(["pull", image], timeout=600, kind="image")
+            _docker(["pull", image], timeout=PULL_TIMEOUT_S, kind="image")
             found = _docker(["image", "inspect", "--format", "{{.Id}}", image], kind="image")
         return found.stdout.decode().strip()
 
@@ -230,7 +324,8 @@ class DockerSandboxProvider:
         context = dockerfile.parent
         tag = self.tooling_tag(dockerfile)
         if _docker(["image", "inspect", tag], check=False).returncode != 0:
-            _docker(["build", "-q", "-t", tag, "-f", str(dockerfile), str(context)], timeout=900, kind="image")
+            _docker(["build", "-q", "-t", tag, "-f", str(dockerfile), str(context)],
+                    timeout=TOOLING_BUILD_TIMEOUT_S, kind="image")
         return tag
 
     def create(self, image: str, *, labels: dict[str, str], network: str = "none",
@@ -266,10 +361,12 @@ class DockerSandboxProvider:
         except InfraError:
             return 0
 
-    def reap_stale(self, live_claims: set[str]) -> int:
-        """Remove every harness sandbox whose claim is no longer live (dead workers' leftovers)."""
+    def reap_stale(self, live_claims: set[str], home: str) -> int:
+        """Remove this home's harness sandboxes whose claim is no longer live (dead workers'
+        leftovers). Filtering by `vals.home` keeps a worker (or a test) with another
+        VALS_HOME from deleting live containers it knows nothing about."""
         try:
-            out = _docker(["ps", "-a", "--filter", "label=vals.managed=1",
+            out = _docker(["ps", "-a", "--filter", "label=vals.managed=1", "--filter", f"label=vals.home={home}",
                            "--format", '{{.ID}} {{.Label "vals.claim"}}'], check=False, timeout=60).stdout.decode()
             stale = [cid for cid, _, claim in (line.partition(" ") for line in out.splitlines())
                      if claim not in live_claims]
@@ -294,3 +391,13 @@ def remove_images(refs: list[str]) -> list[str]:
         if _docker(["rmi", ref], check=False, timeout=120).returncode != 0:
             refused.append(ref)
     return refused
+
+
+def image_ids(refs: list[str]) -> dict[str, str]:
+    """Local image id of each ref that exists locally (missing refs are left out)."""
+    out: dict[str, str] = {}
+    for ref in refs:
+        r = _docker(["image", "inspect", "--format", "{{.Id}}", ref], check=False, timeout=60)
+        if r.returncode == 0:
+            out[ref] = r.stdout.decode().strip()
+    return out
