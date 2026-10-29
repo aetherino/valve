@@ -89,3 +89,40 @@ def test_env_check_flags_declared_expectations_the_chamber_lacks(root, tmp_path,
     assert t["metrics"]["n_not_found"] == 1
     assert s["env"]["missing"] == ({"bash": 1} if missing else {})
     assert s["env"]["commands_not_found"] == 1
+
+
+SYNC_CLI = r"""#!/usr/lib/phantom/bash.real
+# Mixes local file edits (like Claude's Write tool) with relayed shell commands.
+cat > /dev/null
+echo "from-box" > local.txt                              # local write, never through the shell
+seen_in_chamber=$(sh -c 'cat local.txt')                 # pushed before the command runs?
+sh -c 'echo from-chamber > chamber.txt && mkdir -p d && echo x > d/f'
+seen_in_box=$(cat chamber.txt; cat d/f)                  # pulled after the command?
+rm local.txt                                             # local delete
+gone_in_chamber=$(sh -c 'test -e local.txt && echo still-there || echo gone')
+printf 'def add():\n    return 4\n' > solution.py         # last edit: pushed when the agent exits
+printf '{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":0,"result":"chamber_saw=%s box_saw=%s delete=%s"}\n' \
+  "$seen_in_chamber" "$(echo $seen_in_box)" "$gone_in_chamber"
+"""
+
+
+@pytest.mark.parametrize("link", ["network", "volumes"])
+def test_phantom_workspace_stays_in_step_with_the_chamber(root, tmp_path, monkeypatch, link):
+    folder = tmp_path / f"fake-sync-{link}"
+    folder.mkdir()
+    (folder / "fakecli").write_text(SYNC_CLI)
+    (folder / "install.Dockerfile").write_text("ARG BASE\nFROM ${BASE}\nCOPY fakecli /usr/local/bin/fakecli\n"
+                                               "RUN chmod +x /usr/local/bin/fakecli\n")
+    (folder / "agent.yaml").write_text(f"name: fake-sync-{link}\nplacement: phantom\nlink: {link}\n"
+                                       "installed: {run: fakecli, output_parser: claude_stream_json}\n")
+    monkeypatch.setenv("VALS_HOME", str(tmp_path / "home"))
+    paths = service.Paths.from_root(root)
+    run_id = service.submit(paths, RunSpec(agent=str(folder), benchmark="python-tasks", task_ids=["py-001"]))
+    service.work(paths, run_id=run_id)
+    (t,) = summarize(Store(paths.db), run_id)["trials"]
+    assert t["status"] == "graded", t
+    msg = t["agent"]["message"]
+    assert "chamber_saw=from-box" in msg, msg          # box edit reached the chamber before the command
+    assert "box_saw=from-chamber x" in msg, msg        # chamber's files (and new dir) reached the box
+    assert "delete=gone" in msg, msg                   # a local delete propagated
+    assert t["grade"]["passed"], t                     # the final edit was pushed and graded

@@ -2,10 +2,13 @@
 //!
 //! One static binary, two roles, picked by how it is invoked:
 //!
-//! * `phantom run --output <file> -- <agent cmd...>`: the **runner**, the box's main
-//!   process. It speaks vals-agent/1 (newline-delimited JSON-RPC) with the worker
-//!   over stdin/stdout, starts the agent CLI with the instruction on its stdin, and
-//!   serves a unix socket inside the box for phantom shells. When the agent exits it
+//! * `phantom run --output <file> [--connect HOST:PORT --token T --sync] -- <agent cmd...>`:
+//!   the **runner**, the box's main process. It speaks vals-agent/1 (newline-delimited
+//!   JSON-RPC) with the worker's Chamber API, over stdin/stdout or, with `--connect`,
+//!   over TCP (so the box can run anywhere that reaches the worker). It starts the agent
+//!   CLI with the instruction on its stdin and serves a unix socket inside the box for
+//!   phantom shells. With `--sync` the box keeps its own copy of the workspace, kept in
+//!   step with the chamber at command boundaries (see sync.rs). When the agent exits it
 //!   sends the agent's output as an artifact and reports `finish`.
 //!
 //! * as `sh` / `bash` (installed over /bin/sh and /bin/bash): the **phantom shell**.
@@ -14,11 +17,13 @@
 //!   exits with the command's exit code. It never forwards its environment, so the
 //!   box's secrets never reach the chamber.
 
+mod sync;
+
 use base64::Engine;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -32,6 +37,7 @@ use std::time::Duration;
 const SOCKET: &str = "/run/phantom/phantom.sock";
 const REAL_BASH: &str = "/usr/lib/phantom/bash.real";
 const PROTOCOL: &str = "vals-agent/1";
+const CWD_MARKER: &str = "__VALS_CWD__";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -62,14 +68,20 @@ fn shell(argv0: &str, args: &[String]) -> i32 {
         return 126;
     }
     let cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| "/".into());
-    let req = json!({"cmd": forwardable(&cmd), "cwd": cwd});
+    let (forward, cwd_file) = forwardable(&cmd);
+    let req = json!({"cmd": forward, "cwd": cwd});
     match relay(&req) {
         Ok(resp) => {
             if let Some(err) = resp.get("error") {
                 eprintln!("phantom shell: {}", err.get("message").and_then(Value::as_str).unwrap_or("error"));
                 return 126;
             }
-            let out = resp.get("output").and_then(Value::as_str).unwrap_or("");
+            let raw = resp.get("output").and_then(Value::as_str).unwrap_or("");
+            let (out, new_cwd) = split_cwd(raw);
+            if let (Some(file), Some(dir)) = (cwd_file, new_cwd) {
+                // The agent CLI reads its cwd file from *this* box's /tmp.
+                let _ = fs::write(&file, dir);
+            }
             let _ = std::io::stdout().write_all(out.as_bytes());
             let _ = std::io::stdout().flush();
             if resp.get("timed_out").and_then(Value::as_bool).unwrap_or(false) {
@@ -111,14 +123,33 @@ fn command_from_args(argv0: &str, args: &[String]) -> Option<String> {
 /// Claude Code wraps each command as
 ///   source <snapshot> ... && { \builtin unalias ...; } ... && eval '<CMD>' < /dev/null && pwd -P >| <cwd file>
 /// The prefix is bash-only (and refers to a snapshot of *this* box's shell), so only
-/// the POSIX tail is sent: it runs under any sh and keeps the cwd tracking working.
-fn forwardable(cmd: &str) -> String {
+/// the POSIX tail is sent: it runs under any sh. The cwd file lives in the box, not the
+/// chamber, so instead of writing it there the command reports its final cwd after a
+/// marker in its output; the phantom shell strips that and writes the file locally.
+/// Returns (command to forward, cwd file to write).
+fn forwardable(cmd: &str) -> (String, Option<String>) {
+    let mut body = cmd;
     if cmd.starts_with("source ") {
         if let Some(i) = cmd.find("eval '") {
-            return cmd[i..].to_string();
+            body = &cmd[i..];
         }
     }
-    cmd.to_string()
+    if let Some(j) = body.rfind(" && pwd -P >| ") {
+        let file = body[j + " && pwd -P >| ".len()..].trim().to_string();
+        let core = &body[..j];
+        let fwd = format!("{core}; __vals_rc=$?; [ $__vals_rc -eq 0 ] && printf '\\n{CWD_MARKER}%s\\n' \"$(pwd -P)\"; exit $__vals_rc");
+        return (fwd, Some(file));
+    }
+    (body.to_string(), None)
+}
+
+/// Split the cwd report off a command's output: (output for the agent, final cwd).
+fn split_cwd(out: &str) -> (&str, Option<&str>) {
+    let marker = format!("\n{CWD_MARKER}");
+    match out.rfind(&marker) {
+        Some(k) => (&out[..k], Some(out[k + marker.len()..].trim_end_matches('\n'))),
+        None => (out, None),
+    }
 }
 
 fn shell_quote(s: &str) -> String {
@@ -138,7 +169,7 @@ fn relay(req: &Value) -> std::io::Result<Value> {
 type Pending = Arc<Mutex<HashMap<u64, Sender<Value>>>>;
 
 struct Worker {
-    out: Mutex<std::io::Stdout>,
+    out: Mutex<Box<dyn Write + Send>>,
     pending: Pending,
     next_id: AtomicU64,
 }
@@ -160,23 +191,56 @@ impl Worker {
     }
 }
 
+/// Connect to the worker's Chamber API: stdio (local box) or TCP with a token (anywhere).
+fn connect(addr: Option<&str>, token: &str) -> std::io::Result<(Box<dyn BufRead + Send>, Box<dyn Write + Send>)> {
+    let Some(addr) = addr else {
+        return Ok((Box::new(BufReader::new(std::io::stdin())), Box::new(std::io::stdout())));
+    };
+    let mut last = None;
+    for _ in 0..60 {   // the worker may still be setting up; retry for ~30 s
+        match std::net::TcpStream::connect(addr) {
+            Ok(mut s) => {
+                s.write_all(format!("{}\n", json!({"token": token})).as_bytes())?;
+                let mut reader = BufReader::new(s.try_clone()?);
+                let mut line = String::new();
+                reader.read_line(&mut line)?;
+                if !line.contains("\"ok\"") {
+                    return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Chamber API refused the token"));
+                }
+                return Ok((Box::new(reader), Box::new(s)));
+            }
+            Err(e) => { last = Some(e); thread::sleep(Duration::from_millis(500)); }
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("connect failed")))
+}
+
 fn run(args: &[String]) -> i32 {
     let mut output = String::from("/tmp/vals/agent/output.jsonl");
+    let (mut addr, mut token, mut sync_on) = (None::<String>, String::new(), false);
     let mut i = 0;
     while i < args.len() && args[i] != "--" {
-        if args[i] == "--output" && i + 1 < args.len() {
-            output = args[i + 1].clone();
-            i += 1;
+        match args[i].as_str() {
+            "--output" if i + 1 < args.len() => { output = args[i + 1].clone(); i += 1; }
+            "--connect" if i + 1 < args.len() => { addr = Some(args[i + 1].clone()); i += 1; }
+            "--token" if i + 1 < args.len() => { token = args[i + 1].clone(); i += 1; }
+            "--sync" => sync_on = true,
+            _ => {}
         }
         i += 1;
     }
+    let token = std::env::var("PHANTOM_TOKEN").unwrap_or(token);   // prefer env: not visible in `ps`
     let agent_cmd: Vec<String> = args.get(i + 1..).map(|s| s.to_vec()).unwrap_or_default();
     if agent_cmd.is_empty() {
         eprintln!("phantom run: missing agent command after --");
         return 2;
     }
 
-    let worker = Arc::new(Worker { out: Mutex::new(std::io::stdout()), pending: Arc::default(),
+    let (reader, writer) = match connect(addr.as_deref(), &token) {
+        Ok(rw) => rw,
+        Err(e) => { eprintln!("phantom run: cannot reach the Chamber API: {e}"); return 1; }
+    };
+    let worker = Arc::new(Worker { out: Mutex::new(writer), pending: Arc::default(),
                                    next_id: AtomicU64::new(1) });
     let child: Arc<Mutex<Option<Child>>> = Arc::default();
     let (start_tx, start_rx) = channel::<Value>();
@@ -184,8 +248,7 @@ fn run(args: &[String]) -> i32 {
         // Reader: responses go to whoever is waiting on that id; `start` to main; `cancel` kills the agent.
         let (pending, child) = (worker.pending.clone(), child.clone());
         thread::spawn(move || {
-            let stdin = std::io::stdin();
-            for line in stdin.lock().lines() {
+            for line in reader.lines() {
                 let Ok(line) = line else { break };
                 let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
                 if let Some(id) = msg.get("id").and_then(Value::as_u64) {
@@ -201,7 +264,7 @@ fn run(args: &[String]) -> i32 {
                     _ => {}
                 }
             }
-            // The worker closed our stdin: nothing left to report to. Stop the agent.
+            // The worker closed the connection: nothing left to report to. Stop the agent.
             if let Some(c) = child.lock().unwrap().as_mut() { let _ = c.kill(); }
             std::process::exit(0);
         });
@@ -221,7 +284,15 @@ fn run(args: &[String]) -> i32 {
     let cmd_timeout = config.get("command_timeout_s").and_then(Value::as_u64).unwrap_or(600);
     let workspace = start.get("workspace").and_then(Value::as_str).unwrap_or("/workspace").to_string();
 
-    if let Err(e) = serve_shells(worker.clone(), cmd_timeout) {
+    let mirror = sync_on.then(|| Arc::new(sync::Mirror::new(&workspace)));
+    if let Some(m) = &mirror {
+        // Initial mirror: the chamber's workspace, before the agent sees anything.
+        if let Err(e) = m.pull(&worker) {
+            worker.request("finish", json!({"exit_status": "agent_error", "message": format!("initial sync: {e}")}));
+            return 1;
+        }
+    }
+    if let Err(e) = serve_shells(worker.clone(), cmd_timeout, mirror.clone()) {
         worker.request("finish", json!({"exit_status": "agent_error", "message": format!("socket: {e}")}));
         return 1;
     }
@@ -253,6 +324,10 @@ fn run(args: &[String]) -> i32 {
         thread::sleep(Duration::from_millis(100));
     }
 
+    if let Some(m) = &mirror {
+        let _ = m.push(&worker);   // the agent's last file edits
+    }
+
     // Report: the raw output as an artifact, then the parsed outcome.
     let raw = fs::read(&output).unwrap_or_default();
     worker.request("artifact", json!({"name": "output.jsonl",
@@ -266,19 +341,24 @@ fn run(args: &[String]) -> i32 {
 }
 
 /// Accept phantom-shell connections; each becomes one Chamber API `exec`.
-fn serve_shells(worker: Arc<Worker>, cmd_timeout: u64) -> std::io::Result<()> {
+fn serve_shells(worker: Arc<Worker>, cmd_timeout: u64, mirror: Option<Arc<sync::Mirror>>) -> std::io::Result<()> {
     if let Some(dir) = Path::new(SOCKET).parent() { fs::create_dir_all(dir)?; }
     let _ = fs::remove_file(SOCKET);
     let listener = UnixListener::bind(SOCKET)?;
     thread::spawn(move || {
         for conn in listener.incoming().flatten() {
-            let worker = worker.clone();
+            let (worker, mirror) = (worker.clone(), mirror.clone());
             thread::spawn(move || {
                 let mut line = String::new();
                 let mut reader = BufReader::new(match conn.try_clone() { Ok(c) => c, Err(_) => return });
                 if reader.read_line(&mut line).is_err() { return; }
                 let Ok(req) = serde_json::from_str::<Value>(&line) else { return };
-                let resp = worker.request("exec", json!({"cmd": req["cmd"], "cwd": req["cwd"], "timeout_s": cmd_timeout}));
+                let exec = || worker.request("exec", json!({"cmd": req["cmd"], "cwd": req["cwd"], "timeout_s": cmd_timeout}));
+                let resp = match &mirror {
+                    // push the box's edits -> run in the chamber -> pull the chamber's changes
+                    Some(m) => m.around(&worker, exec),
+                    None => exec(),
+                };
                 let mut conn = conn;
                 let _ = conn.write_all(format!("{resp}\n").as_bytes());
             });
@@ -334,10 +414,15 @@ mod tests {
     }
 
     #[test]
-    fn strips_claude_wrapper_to_posix_tail() {
+    fn strips_claude_wrapper_and_reports_cwd_through_output() {
         let c = "source /tmp/cc/snap.sh 2>/dev/null || true && shopt -u extglob 2>/dev/null || true && { \\builtin unalias -- 'x'; } >/dev/null 2>&1 || true && eval 'echo hi' < /dev/null && pwd -P >| /tmp/claude-1-cwd";
-        assert_eq!(forwardable(c), "eval 'echo hi' < /dev/null && pwd -P >| /tmp/claude-1-cwd");
-        assert_eq!(forwardable("ls; eval 'x'"), "ls; eval 'x'");
+        let (fwd, file) = forwardable(c);
+        assert!(fwd.starts_with("eval 'echo hi' < /dev/null; __vals_rc=$?;"), "{fwd}");
+        assert!(fwd.contains(CWD_MARKER) && fwd.ends_with("exit $__vals_rc"));
+        assert_eq!(file.as_deref(), Some("/tmp/claude-1-cwd"));
+        assert_eq!(forwardable("ls; eval 'x'"), ("ls; eval 'x'".to_string(), None));
+        assert_eq!(split_cwd("out\n__VALS_CWD__/app/sub\n"), ("out", Some("/app/sub")));
+        assert_eq!(split_cwd("plain"), ("plain", None));
     }
 
     #[test]

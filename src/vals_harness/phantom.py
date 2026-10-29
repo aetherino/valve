@@ -22,12 +22,16 @@ import hashlib
 import os
 import shlex
 import shutil
+import socket
+import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 from vals_harness.errors import InfraError
 from vals_harness.installed import InstalledRunner, _public_env, _secret_env
 from vals_harness.launchers import ProcessSession, _start
+from vals_harness.netlink import TrialListener
 from vals_harness.protocol import StdioTransport
 from vals_harness.sandbox.docker import build_lock, HARDENING, _docker
 from vals_harness.specs import AgentSpec
@@ -37,6 +41,7 @@ RUST_IMAGE = "rust:1.93-alpine"
 OUTPUT = "/var/lib/phantom/output.jsonl"   # box-only: the chamber can't rewrite it
 BOX_CPUS = "1"
 BOX_MEMORY = "2g"
+CONNECT_TIMEOUT_S = 120
 
 PHANTOM_LAYER = f"""\
 ARG BASE
@@ -113,13 +118,19 @@ class PhantomLauncher:
         return f"vals/phantom-{agent.name}:{h.hexdigest()[:12]}"
 
     def launch(self, agent: AgentSpec, image_id: str, stderr_path: Path, labels: dict[str, str],
-               volumes: dict[str, str]) -> ProcessSession:
+               volumes: dict[str, str], workspace: str = "/workspace") -> ProcessSession:
+        """Start the box. `network` link (default): the box dials this trial's Chamber API
+        listener over TCP with a one-time token and mirrors the workspace itself, so the
+        same box could run on a vendor's host. `volumes` link: local stdio + shared volumes."""
         rt = agent.installed
         if rt is None:
             raise InfraError("adapter", f"agent {agent.name} has no installed runtime")
+        network_link = agent.link == "network"
         name = f"vals-phantom-{labels.get('vals.claim', os.urandom(6).hex())[:12]}"
-        argv = ["docker", "run", "-i", "--rm", "--pull", "never", "--name", name,
+        argv = ["docker", "run", "--rm", "--pull", "never", "--name", name,
                 "--label", "vals.managed=1", "--label", "vals.role=phantom"]
+        if not network_link:
+            argv.insert(2, "-i")
         for k, v in labels.items():
             argv += ["--label", f"{k}={v}"]
         argv += [*HARDENING, "--cpus", BOX_CPUS, "--memory", BOX_MEMORY, "--network", "bridge"]
@@ -128,11 +139,44 @@ class PhantomLauncher:
         for k, v in _public_env(rt).items():
             argv += ["-e", f"{k}={v}"]
         secrets = _secret_env(agent, rt)
+        listener = TrialListener() if network_link else None
+        if listener:
+            secrets = {**secrets, "PHANTOM_TOKEN": listener.token}
+            argv += ["--add-host", "host.docker.internal:host-gateway"]   # Linux; built in on Docker Desktop
         for k in secrets:
             argv += ["-e", k]            # value comes from the docker CLI's environment, never argv
-        workspace = next((p for p in volumes.values() if p != "/tmp"), "/workspace")
-        argv += ["-w", workspace, image_id, "phantom", "run", "--output", OUTPUT, "--", *shlex.split(rt.run)]
-        proc = _start(argv, cwd=None, env={**os.environ, **secrets}, stderr_path=stderr_path, name=agent.name)
-        assert proc.stdin and proc.stdout
-        return ProcessSession(proc, StdioTransport(proc.stdout, proc.stdin), container=name)
+        runner = ["phantom", "run", "--output", OUTPUT]
+        if listener:
+            runner += ["--connect", listener.address, "--sync"]
+        argv += ["-w", workspace, image_id, *runner, "--", *shlex.split(rt.run)]
+        env = {**os.environ, **secrets}
+        if not listener:
+            proc = _start(argv, cwd=None, env=env, stderr_path=stderr_path, name=agent.name)
+            assert proc.stdin and proc.stdout
+            return ProcessSession(proc, StdioTransport(proc.stdout, proc.stdin), container=name)
+        # Network link: the container's own output is just logs; the protocol is the socket.
+        with open(stderr_path, "wb") as log:
+            proc = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            conn, transport = listener.accept(CONNECT_TIMEOUT_S, alive=lambda: proc.poll() is None)
+        except InfraError:
+            _docker(["rm", "-f", name], check=False, timeout=60)
+            proc.kill()
+            raise
+        return NetSession(proc, transport, container=name, sock=conn)
 
+
+@dataclass
+class NetSession(ProcessSession):
+    """A box reached over TCP: wait/kill act on its container, the protocol on the socket."""
+
+    sock: socket.socket | None = None
+
+    def kill(self) -> None:
+        super().kill()
+        if self.sock is not None:
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            self.sock.close()

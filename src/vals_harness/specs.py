@@ -193,6 +193,10 @@ class AgentSpec(Frozen):
     placement: Literal["host", "sidecar", "installed", "phantom"]
     command: list[str] = []                 # how to start the agent runner (host/sidecar)
     installed: InstalledRuntime | None = None   # placement: installed / phantom
+    # phantom only: how the box reaches the chamber. "network": it dials the Chamber API
+    # over TCP and mirrors the workspace itself (can run anywhere, e.g. a vendor's host).
+    # "volumes": local only, stdio + workspace and /tmp shared as Docker volumes.
+    link: Literal["network", "volumes"] = "network"
     secrets: list[str] = []                 # env var names forwarded to the agent only; required
     optional_secrets: list[str] = []        # forwarded if set (e.g. ANTHROPIC_WORKSPACE_ID)
     # Programs the agent assumes the chamber has (e.g. bash). Not enforced: the harness

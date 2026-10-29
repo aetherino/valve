@@ -8,7 +8,10 @@ out of time. Every action is recorded. The agent never touches the sandbox itsel
 from __future__ import annotations
 
 import base64
+import io
 import math
+import tarfile
+import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -23,6 +26,7 @@ from vals_harness.protocol import (CANCELLED, CHAMBER_ERROR, CHAMBER_STOPPED, IN
 from vals_harness.sandbox import Sandbox
 
 HELLO_TIMEOUT_S = 30
+SYNC_MAX_BYTES = 24_000_000   # one sync message (base64 adds a third); bigger workspaces: v2 FUSE mirror
 CANCEL_GRACE_S = 10
 EXIT_GRACE_S = 10
 WATCHDOG_SLACK_S = 5   # past deadline + grace, the agent process is killed unconditionally
@@ -218,8 +222,9 @@ class ChamberApi:
             t.send(result(id_, {}))
             return self._outcome_from(params)
 
-        handler = {"exec": self._exec, "put": self._put, "get": self._get,
-                   "artifact": self._artifact}.get(method if isinstance(method, str) else "")
+        handler = {"exec": self._exec, "put": self._put, "get": self._get, "artifact": self._artifact,
+                   "sync_pull": self._sync_pull, "sync_push": self._sync_push,
+                   }.get(method if isinstance(method, str) else "")
         if handler is None:
             t.send(error(id_, METHOD_NOT_FOUND, f"unknown method {method!r}"))
             return None
@@ -281,6 +286,60 @@ class ChamberApi:
         data = self.sandbox.get(path)
         self.rec.transcript({"type": "get", "path": path, "bytes": len(data)})
         return {"data_b64": base64.b64encode(data).decode()}
+
+    # ------------------------------------------------------------------ workspace sync
+    # For agent boxes that keep their own copy of the workspace (phantom over the
+    # network): pull what the chamber changed, push what the box's file tools changed.
+    # Sync happens at command boundaries, which is when an agent's view must be right.
+
+    def _sync_pull(self, p: dict[str, Any]) -> dict[str, Any]:
+        """-> {tar_b64: entries with mtime >= since, paths: every entry now, now: newest mtime}.
+        Uses a host-side snapshot (docker cp), so the chamber needs no tar or python."""
+        since = safe_num(p.get("since"), float)
+        with tempfile.TemporaryDirectory(prefix="vals-sync-") as d:
+            snap = Path(d) / "ws.tar"
+            self.sandbox.snapshot(self.workspace, snap)
+            out, paths, newest = io.BytesIO(), [], since
+            prefix = Path(self.workspace).name + "/"
+            with tarfile.open(snap) as src, tarfile.open(fileobj=out, mode="w") as dst:
+                for m in src.getmembers():
+                    if not m.name.startswith(prefix) or not (m.isfile() or m.isdir() or m.issym()):
+                        continue
+                    m.name = m.name[len(prefix):]
+                    paths.append(m.name)
+                    newest = max(newest, float(m.mtime))
+                    if m.mtime >= int(since):   # second granularity: resend the boundary second
+                        dst.addfile(m, src.extractfile(m) if m.isfile() else None)
+        data = out.getvalue()
+        if len(data) > SYNC_MAX_BYTES:
+            raise ValueError(f"workspace changes too large to sync ({len(data)} bytes)")
+        self.rec.event("sync_pull", {"bytes": len(data), "entries": len(paths)})
+        return {"tar_b64": base64.b64encode(data).decode(), "paths": paths, "now": newest}
+
+    def _sync_push(self, p: dict[str, Any]) -> dict[str, Any]:
+        """{tar_b64, deletes}: apply the box's file changes to the chamber's workspace.
+        Agent-controlled input: members go through tarfile's data filter, deletes must be
+        relative paths inside the workspace."""
+        raw = base64.b64decode(p.get("tar_b64") or "", validate=True)
+        deletes = p.get("deletes") or []
+        if not isinstance(deletes, list) or not all(isinstance(x, str) for x in deletes):
+            raise TypeError("deletes must be a list of strings")
+        bad = [x for x in deletes if not x or x.startswith("/") or ".." in Path(x).parts]
+        if bad:
+            raise ValueError(f"deletes must be relative paths inside the workspace: {bad[:3]}")
+        n = 0
+        if raw:
+            with tempfile.TemporaryDirectory(prefix="vals-push-") as d:
+                with tarfile.open(fileobj=io.BytesIO(raw)) as tar:
+                    tar.extractall(d, filter="data")
+                    n = len(tar.getmembers())
+                if any(Path(d).iterdir()):
+                    self.sandbox.put_dir(Path(d), self.workspace)
+        if deletes:
+            quoted = " ".join("'" + x.replace("'", "'\\''") + "'" for x in deletes)
+            self.sandbox.exec(f"rm -rf -- {quoted}", timeout=60, cwd=self.workspace)
+        self.rec.event("sync_push", {"entries": n, "deletes": len(deletes)})
+        return {}
 
     def _artifact(self, p: dict[str, Any]) -> dict[str, Any]:
         self.rec.artifact(str(p["name"]), base64.b64decode(p["data_b64"], validate=True))

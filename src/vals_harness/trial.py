@@ -116,7 +116,8 @@ class TrialRunner:
             # needs egress (v2: model proxy only). Everything else stays offline.
             network = "egress" if placement == "installed" else spec.policy.network
             # Phantom box and chamber share the workspace and /tmp (per-trial volumes).
-            volumes = phantom_volumes(claim.token, labels, workspace) if placement == "phantom" else None
+            volumes = (phantom_volumes(claim.token, labels, workspace)
+                       if placement == "phantom" and spec.agent.link == "volumes" else None)
             grade = vr = None
             # Created from a pinned image id, so a tag can't move under a running trial.
             with self.provider.create(chamber_image, labels={**labels, "vals.role": "chamber"},
@@ -132,7 +133,7 @@ class TrialRunner:
                 else:
                     if placement == "phantom":
                         session = self.phantom.launch(spec.agent, pins["agent_image"], folder / "agent_stderr.log",
-                                                      labels, volumes or {})
+                                                      labels, volumes or {}, workspace)
                     else:
                         session = launcher.launch(spec.agent, folder / "agent_stderr.log", labels)  # type: ignore[union-attr]
                     api = ChamberApi(chamber, rec, trial_id=spec.trial_id,
