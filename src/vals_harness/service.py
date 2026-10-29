@@ -212,6 +212,8 @@ def current_image_tags(paths: Paths) -> set[str]:
         agent = load_agent(str(folder.parent), paths.root)
         if agent.placement == "sidecar":
             keep.add(DockerLauncher.tag_for(agent))
+        elif agent.placement == "installed":
+            keep.add(f"vals/installed-{agent.name}:*")   # one per task image; see prune()
     for folder in sorted((paths.root / "benchmarks").glob("*/harness.yaml")):
         bench = load_benchmark(str(folder.parent), paths.root)
         if bench.tooling_dockerfile:
@@ -223,7 +225,9 @@ def prune(paths: Paths, *, dry_run: bool = False) -> dict[str, list[str] | int]:
     """Remove harness images that no current agent/benchmark folder would build, and
     containers left by dead workers. Images still in use are kept (Docker refuses)."""
     keep = current_image_tags(paths)
-    stale = sorted(set(vals_images()) - keep)
+    wild = {k[:-1] for k in keep if k.endswith(":*")}   # installed layers: kept per agent
+    stale = sorted(i for i in set(vals_images()) - keep
+                   if not any(i.startswith(w) for w in wild) and not i.startswith("vals/base:"))
     containers = 0
     refused: list[str] = []
     if not dry_run:

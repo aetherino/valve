@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import subprocess
 import threading
 import time
@@ -44,7 +45,7 @@ def _docker(args: list[str], *, input: bytes | None = None, timeout: float = 120
 
 
 def _run_capped(argv: list[str], *, timeout: float, cap: int, stdin: bytes | None = None,
-                sink: Path | None = None) -> tuple[bytes, int, bool, bool]:
+                sink: Path | None = None, env: dict[str, str] | None = None) -> tuple[bytes, int, bool, bool]:
     """Run a command, keeping at most `cap` bytes of its merged output in memory.
 
     Output past the cap is read and discarded, so the child never blocks on a full
@@ -52,7 +53,7 @@ def _run_capped(argv: list[str], *, timeout: float, cap: int, stdin: bytes | Non
     `sink`, output streams to that file instead (still capped).
     Returns (output, returncode, killed_by_timeout, truncated).
     """
-    proc = subprocess.Popen(argv, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+    proc = subprocess.Popen(argv, env=env, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT if sink is None else subprocess.PIPE)
     killed = threading.Event()
 
@@ -114,10 +115,15 @@ class DockerSandbox:
     # -------------------------------------------------------------- commands
 
     def exec(self, cmd: str, *, timeout: int, cwd: str = "/workspace",
-             env: dict[str, str] | None = None, stdin: bytes | None = None) -> ExecResult:
+             env: dict[str, str] | None = None, stdin: bytes | None = None,
+             secret_env: dict[str, str] | None = None) -> ExecResult:
+        """`secret_env` values travel through the docker CLI's own environment
+        (`-e NAME`), so they never appear on a command line or in `ps`."""
         args = ["exec"] + (["-i"] if stdin is not None else []) + ["-w", cwd]
         for k, v in (env or {}).items():
             args += ["-e", f"{k}={v}"]
+        for k in secret_env or {}:
+            args += ["-e", k]
         # Killing the docker client does not kill the process inside the container,
         # so enforce the timeout in-container when the image has `timeout`.
         wrapper = ["timeout", "-s", "KILL", str(timeout)] if self._has_timeout else []
@@ -125,7 +131,8 @@ class DockerSandbox:
 
         start = time.monotonic()
         out, rc, killed, truncated = _run_capped(["docker", *args], timeout=timeout + CLIENT_GRACE_S,
-                                                 cap=MAX_OUTPUT_BYTES, stdin=stdin)
+                                                 cap=MAX_OUTPUT_BYTES, stdin=stdin,
+                                                 env={**os.environ, **secret_env} if secret_env else None)
         duration = time.monotonic() - start
         # A non-zero exit is normally the agent's command failing. Only if Docker says
         # the container is gone is it the harness's problem.

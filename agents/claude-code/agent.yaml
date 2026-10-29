@@ -1,0 +1,26 @@
+# Claude Code, installed in the chamber (the Harbor / Inspect SWE pattern): its
+# Read/Edit/Bash tools act on the machine it runs on, so it can't be a sidecar
+# without a shell relay (DESIGN.md §5.1, stretch).
+name: claude-code
+version: "2.1.312"
+placement: installed
+installed:
+  dockerfile: install.Dockerfile
+  # Headless. Claude Code refuses --dangerously-skip-permissions as root, so its
+  # tools are pre-approved explicitly instead; the chamber stays root like the task expects.
+  run: >-
+    claude -p --output-format stream-json --verbose
+    --model {model} --max-turns {max_turns}
+    --allowedTools "Bash Read Write Edit Glob Grep"
+  env:
+    CLAUDE_CONFIG_DIR: /tmp/vals/agent          # session logs land here, outside /workspace
+    USE_BUILTIN_RIPGREP: "0"                    # use the image's ripgrep (needed on musl/alpine)
+    DISABLE_AUTOUPDATER: "1"
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+    ANTHROPIC_CUSTOM_HEADERS: "anthropic-workspace-id: ${ANTHROPIC_WORKSPACE_ID}"   # only if set
+  logs_dir: /tmp/vals/agent
+  output_parser: claude_stream_json
+secrets: [ANTHROPIC_API_KEY]
+defaults:
+  model: claude-opus-5-5
+  step_limit: 50          # -> --max-turns

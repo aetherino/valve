@@ -117,14 +117,33 @@ def load_tasks(bench: BenchmarkSpec) -> list[Task]:
 # ------------------------------------------------------------------ agent
 
 
+class InstalledRuntime(Frozen):
+    """How an off-the-shelf CLI agent is installed into and run inside the chamber."""
+
+    dockerfile: str = "install.Dockerfile"  # in the agent folder; `ARG BASE` / `FROM ${BASE}`
+    run: str                                # shell command; placeholders {model} {max_turns}; stdin = instruction
+    env: dict[str, str] = {}                # extra env; "${VAR}" expands from the worker's env (skipped if unset)
+    logs_dir: str = "/tmp/vals/agent"       # copied out as an artifact after the run
+    output_parser: Literal["claude_stream_json"]
+
+
 class AgentSpec(Frozen):
     name: str
     version: str = "0"
     placement: Literal["host", "sidecar", "installed"]
-    command: list[str]                      # how to start the agent runner (host/sidecar)
+    command: list[str] = []                 # how to start the agent runner (host/sidecar)
+    installed: InstalledRuntime | None = None   # placement: installed
     secrets: list[str] = []                 # env var names forwarded to the agent only
     defaults: dict[str, Any] = {}           # model + limit defaults
     root: Path                              # set by the loader: the agent folder
+
+    @model_validator(mode="after")
+    def _placement_fields(self) -> AgentSpec:
+        if self.placement == "installed" and self.installed is None:
+            raise ValueError("placement: installed needs an `installed:` section")
+        if self.placement != "installed" and not self.command:
+            raise ValueError(f"placement: {self.placement} needs a `command`")
+        return self
 
 
 def load_agent(ref: str, root: Path) -> AgentSpec:

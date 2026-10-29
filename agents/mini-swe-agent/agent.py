@@ -35,11 +35,7 @@ EXIT_MAP = {"Submitted": "submitted", "LimitsExceeded": "step_limit", "TimeExcee
 
 
 class ChamberEnvironment:
-    """Implements mini's environment interface (execute / get_template_vars / serialize).
-
-    Named "Environment" because that is mini's term; on our side it is a client of the
-    Chamber API.
-    """
+    """Implements mini's environment interface (execute / get_template_vars / serialize)."""
 
     def __init__(self, client: AgentClient, *, env: dict[str, str], timeout: int, cwd: str):
         self.client = client

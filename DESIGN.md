@@ -33,6 +33,8 @@ Status: draft for discussion. **(proposed)** marks decisions still open to chang
 | Faked pass | `pass_requires` (grader's own evidence must appear) | Trust grade.py's exit code | `os._exit(0)` at import scored 100%. Residual risk: code running inside the grader can still print a fake summary; a grader that doesn't execute the submission in-process is the full fix |
 | Concurrency safety | Fencing token per claim; per-claim labels and artifact folders | Lease only | A stale worker could overwrite results and delete the new owner's containers |
 | Stuck agents | recv deadline + watchdog that kills the agent process | recv deadline only | An agent that stops reading blocked the worker's write forever |
+| Claude Code as root | `--allowedTools` pre-approval | `--dangerously-skip-permissions` as non-root user | Claude Code refuses skip-permissions as root; switching user would change the task environment (many tasks need root) |
+| Installed runtime | Image layer FROM pinned task image | `npm install` inside a live chamber | Cached, reproducible (pinned id), no slow install inside a running trial |
 | Benchmark scripts | Run in a tooling container | Run on the host | `prepare.py` installs packages; host stays clean |
 | Shell choice (`sh` vs `bash`) | The `Sandbox` | Each agent adapter | It's a property of the image; solved once for all agents |
 | Job unit | Trial | Run | Parallelism, per-trial retry, partial results early |
@@ -318,15 +320,28 @@ defaults: { model: anthropic/claude-opus-5-5, step_limit: 50, cost_limit: 1.0 } 
 
 ```yaml
 name: claude-code
-placement: installed                       # sidecar once §5.1 lands
-adapter: vals_harness.agents.claude_code:ClaudeCode
-runtime:                                   # what gets added to the chamber, recorded in manifest
-  packages: [curl, bash, nodejs, npm]      # installed via the image's package manager
-  install: "npm install -g @anthropic-ai/claude-code@{version}"
-version: "<pinned>"
-secrets: [ANTHROPIC_API_KEY]               # forwarded into chamber as env (v1); dummy key + proxy (v2)
-defaults: { model: claude-opus-5-5, max_turns: 50 }   # passed as ANTHROPIC_MODEL
+version: "2.1.312"
+placement: installed
+installed:
+  dockerfile: install.Dockerfile            # ARG BASE / FROM ${BASE}: built FROM the pinned task image
+  run: >-                                   # stdin = instruction; output = stream-json
+    claude -p --output-format stream-json --verbose --model {model} --max-turns {max_turns}
+    --allowedTools "Bash Read Write Edit Glob Grep"
+  env:
+    CLAUDE_CONFIG_DIR: /tmp/vals/agent      # session logs, outside /workspace, kept as an artifact
+    ANTHROPIC_CUSTOM_HEADERS: "anthropic-workspace-id: ${ANTHROPIC_WORKSPACE_ID}"   # only if set
+  output_parser: claude_stream_json
+secrets: [ANTHROPIC_API_KEY]
+defaults: { model: claude-opus-5-5, step_limit: 50 }   # step_limit -> --max-turns
 ```
+
+How installed agents run (`installed.py`):
+- **Runtime as an image layer, never installed live.** `install.Dockerfile` is built `FROM` the pinned task image (tagged `vals/base:<id>` so it can't move), cached by content hash, and pinned as `agent_image`. The chamber is created from it. Alpine (apk, musl) and Debian (apt) both work.
+- **Driven from the worker with `Sandbox.exec`**: instruction written to `/tmp/vals/instruction.txt` and piped on stdin, output streamed to a file, then parsed (`tool_use` events → transcript; the `result` event → exit status, turns, tokens incl. cache, cost).
+- **Root, without skipping permissions.** Claude Code refuses `--dangerously-skip-permissions` as root (and 2.1.312 ignores `IS_SANDBOX`), so its tools are pre-approved with `--allowedTools`. The chamber stays root, as the task expects.
+- **Secrets** travel as `docker exec -e NAME` through the CLI's own environment, never argv. They are visible to the agent inside the chamber (v1 risk, documented; v2 model proxy with a dummy key).
+- **Network:** the chamber gets egress because the CLI calls its model from there (v2: proxy only).
+- **Observed:** Opus 5.5 via Claude Code scored 5/5 on bash-operations, 2/3 on python-tasks. On py-003 it answered in chat instead of writing `solution.py`: the benchmark's prompt never names the file. Correctly graded 0; the harness doesn't rewrite benchmark prompts.
 
 ### 6.3 RunSpec — built by `harness run`, stored in `runs.spec_json`
 
@@ -463,7 +478,7 @@ harness cancel --run_id ID
 1. ✅ `Sandbox` (Docker) + both benchmark adapters + mini-swe-agent on `host` placement + `run --wait` + SQLite + results.
 2. ✅ `DockerLauncher`: every agent runs in its own sidecar container (`docker run -i`, same stdio protocol). Agent images are built in PREPARE from the agent folder + SDK (default Dockerfile, or the agent's own), tagged by content hash, and pinned by id in the manifest. Secrets passed as `-e NAME` (never on the command line); the container has no mounts, egress for model calls, the standard hardening, and is removed by name on kill.
 3. ✅ Worker supervisor: N slots, one child process per trial, trial wall clock, clean release on shutdown; `harness prune`.
-4. Claude Code, installed (Harbor pattern).
+4. ✅ Claude Code, installed (Harbor pattern): runtime layer FROM the pinned task image, headless stream-json, logs and transcript collected; a fake-CLI test covers the path at $0.
 5. Stretch: Claude Code via `shell_relay` (spike first), model proxy, network lockdown.
 
 ## 12. Timeouts
@@ -491,9 +506,9 @@ They run as sidecar containers like any other agent; a further integration test 
 ```
 vals-harness/
 ├── src/vals_harness/       cli.py · service.py · specs.py · sandbox/ (Sandbox, docker.py) · benchmarks.py · protocol.py
-│                           launchers.py · chamber_api.py · trial.py · trial_child.py · store.py · results.py · errors.py
+│                           launchers.py · chamber_api.py · installed.py · trial.py · trial_child.py · store.py · results.py · errors.py
 ├── src/vals_agent_sdk/     client.py (agent side of vals-agent/1, stdlib only)
-├── agents/                 mini-swe-agent/ · oracle/ · noop/ · cheater/ · vandal/   (claude-code/ in phase 4)
+├── agents/                 mini-swe-agent/ · claude-code/ · oracle/ · noop/ · cheater/ · vandal/
 ├── benchmarks/             bash-operations/ · python-tasks/   (starter files untouched + harness.yaml)
 ├── docker/                 tooling images
 ├── tests/
