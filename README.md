@@ -1,5 +1,82 @@
 # Francisco's Take-home assignment
-NOTE: This document is human-written; the Phantom Box section was updated with Claude's help to match the current code.
+NOTE: This document is human-written; the Setup and Run sections were added, and the Phantom Box section updated, with Claude's help to match the current code.
+
+## Setup
+
+**Requirements:** macOS or Linux, [Docker](https://docs.docker.com/get-docker/) with the daemon running (tested on Docker Desktop), and [uv](https://docs.astral.sh/uv/) (it fetches Python 3.11 itself). No Rust toolchain is needed: the phantom binary is built inside Docker.
+
+```bash
+git clone <this repo> vals && cd vals
+uv sync
+```
+
+**API key** (only for the real agents; the test agents cost $0). Create `.env` in the repo root:
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-...
+# only if your key isn't scoped to a workspace:
+ANTHROPIC_WORKSPACE_ID=wrkspc_...
+```
+
+`.env` is git-ignored, and a value only reaches agents that declare it in their `agent.yaml`.
+
+**Check the install** ($0, no API key needed):
+
+```bash
+uv run harness run --agent agents/oracle --benchmark bash-operations --wait   # expect accuracy 1.000
+uv run pytest -q                                                              # ~2.5 min, needs Docker
+```
+
+The first run of each agent builds its image (mini-swe-agent ≈ 5 min, Claude Code layers ≈ 1–2 min, test agents seconds); later runs reuse them.
+
+## Run
+
+**Run and wait** (an in-process worker; good for trying things):
+
+```bash
+uv run harness run --agent agents/mini-swe-agent --benchmark bash-operations --wait
+uv run harness run --agent agents/claude-code-phantom --benchmark python-tasks --task_ids py-002 --wait --follow
+```
+
+`--follow` prints every command as it runs in the chamber; `--slots N` runs N trials at once.
+
+**Queue, then work** (the asynchronous path):
+
+```bash
+uv run harness run --agent agents/mini-swe-agent --benchmark python-tasks --attempts 3   # prints a run_id, returns at once
+uv run harness run --agent agents/claude-code --benchmark system-tasks
+uv run harness worker --slots 4 --once --follow    # --once: exit when the queue is empty; omit to keep serving
+uv run harness status                              # active runs
+uv run harness status --run_id <run_id>            # one run, per trial
+uv run harness results --run_id <run_id> --format table   # json (default) | table | summary
+uv run harness cancel --run_id <run_id>            # cancel queued trials
+uv run harness prune --dry-run                     # outdated images and leftover containers
+```
+
+Several workers can run at once (e.g. in two terminals); they share one queue.
+
+**Agents** (`--agent agents/<name>`):
+
+| Agent | Placement | Cost |
+|---|---|---|
+| `mini-swe-agent` | sidecar container | ≈ $0.02 / task (Opus 5.5) |
+| `claude-code` | installed in the chamber | ≈ $0.04–0.06 / task |
+| `claude-code-phantom` | phantom box (Chamber API over the network) | ≈ $0.04–0.06 / task |
+| `oracle` · `noop` · `cheater` · `vandal` · `saboteur` | sidecar test agents | $0 (expect 100% · 0% · 0% · 0% · 0%) |
+
+**Benchmarks** (`--benchmark <name>`): `bash-operations` and `python-tasks` (the starter's, unchanged) and `system-tasks` (Harbor-style task folders: a running service, an asset file, a command on PATH).
+
+**Useful options:** `--model anthropic/claude-haiku-5-5` (mini-swe-agent takes litellm names; Claude Code takes `claude-haiku-5-5`), `--limit timeout_s=300 --limit step_limit=20` (repeatable), `--expose-eval-files`.
+
+**Environment variables:**
+
+| Variable | Default | Effect |
+|---|---|---|
+| `VALS_MAX_ACTIVE_TRIALS` | unset | cap on running trials across all workers (each trial runs ≤ 3 containers) |
+| `VALS_HOME` | `.vals/` | where the database and artifacts live |
+| `VALS_CHAMBER_API_BIND` / `VALS_CHAMBER_API_PUBLIC` | `127.0.0.1` / `host.docker.internal` | where the phantom box's Chamber API listens / what address the box dials |
+
+**Where results go:** `.vals/harness.db` (runs, trials, results, events) and one folder per try, `.vals/artifacts/<run>/<trial>/try<N>/`, holding `manifest.json`, `transcript.jsonl`, `agent_logs/`, `workspace.tar`, `verifier.log` and `result.json`.
 
 ## Eval harness: design philosofy
 **Best effort isolation**: I took the desing in the direction of making agents be able to be run inside their own sandboxes, given that some of the agents one might test would require dependencies not normally found inside the specified images.
