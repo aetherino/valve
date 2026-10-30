@@ -4,11 +4,11 @@ from pathlib import Path
 
 import pytest
 
-from vals_harness.benchmarks import (BenchmarkAdapter, PreparedTask, parse_exit_code,
+from valve.benchmarks import (BenchmarkAdapter, PreparedTask, parse_exit_code,
                                      parse_json_stdout)
-from vals_harness.errors import InfraError
-from vals_harness.sandbox import ExecResult
-from vals_harness.specs import load_benchmark, load_tasks
+from valve.errors import InfraError
+from valve.sandbox import ExecResult
+from valve.specs import load_benchmark, load_tasks
 
 
 def _r(output: str, rc: int = 0, timed_out: bool = False) -> ExecResult:

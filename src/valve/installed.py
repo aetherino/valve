@@ -12,13 +12,13 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from vals_harness.chamber_api import AgentOutcome, Recorder, safe_num
-from vals_harness.errors import ChamberStopped, InfraError
-from vals_harness.sandbox import Sandbox
-from vals_harness.sandbox.docker import build_lock, _docker
-from vals_harness.specs import AgentSpec, InstalledRuntime, TrialSpec, folder_digest
+from valve.chamber_api import AgentOutcome, Recorder, safe_num
+from valve.errors import ChamberStopped, InfraError
+from valve.sandbox import Sandbox
+from valve.sandbox.docker import build_lock, _docker
+from valve.specs import AgentSpec, InstalledRuntime, TrialSpec, folder_digest
 
-WORK = "/tmp/vals"           # outside /workspace, so none of this is part of the submission
+WORK = "/tmp/valve"           # outside /workspace, so none of this is part of the submission
 INSTRUCTION = f"{WORK}/instruction.txt"
 STDERR = f"{WORK}/stderr.log"
 INSTALLED_BUILD_TIMEOUT_S = 1800   # see specs.PREPARE_SLACK_S
@@ -28,13 +28,13 @@ class InstalledRunner:
     @staticmethod
     def base_tag(task_image_id: str) -> str:
         """FROM needs a name, so the pinned task image id gets a tag that can't move."""
-        return f"vals/base:{task_image_id.removeprefix('sha256:')[:16]}"
+        return f"valve/base:{task_image_id.removeprefix('sha256:')[:16]}"
 
     @staticmethod
     def tag_for(agent: AgentSpec, task_image_id: str) -> str:
         """Tag = hash of the whole build context (the agent folder) + the task image id."""
         h = hashlib.sha256((folder_digest(agent.root) + task_image_id).encode()).hexdigest()[:12]
-        return f"vals/installed-{agent.name}:{h}"
+        return f"valve/installed-{agent.name}:{h}"
 
     def prepare(self, agent: AgentSpec, task_image_id: str) -> str:
         """Build (once) task image + agent runtime; return the new image id."""

@@ -1,6 +1,6 @@
 """Chamber API: the worker side of one agent session (DESIGN.md §5.1–5.2).
 
-Serves vals-agent/1 for one trial: handshake, task delivery, then exec/put/get
+Serves valve-agent/1 for one trial: handshake, task delivery, then exec/put/get
 against the chamber sandbox until the agent sends `finish`, disconnects, or runs
 out of time. Every action is recorded. The agent never touches the sandbox itself.
 """
@@ -18,12 +18,12 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from vals_harness.errors import ChamberStopped, InfraError
-from vals_harness.launchers import AgentSession
-from vals_harness.protocol import (CANCELLED, CHAMBER_ERROR, CHAMBER_STOPPED, INVALID_PARAMS,
+from valve.errors import ChamberStopped, InfraError
+from valve.launchers import AgentSession
+from valve.protocol import (CANCELLED, CHAMBER_ERROR, CHAMBER_STOPPED, INVALID_PARAMS,
                                    METHOD_NOT_FOUND, NOT_FOUND, PROTOCOL, ProtocolError,
                                    TransportClosed, error, notification, result)
-from vals_harness.sandbox import Sandbox
+from valve.sandbox import Sandbox
 
 HELLO_TIMEOUT_S = 30
 SYNC_MAX_BYTES = 24_000_000   # one sync message (base64 adds a third); bigger workspaces: v2 FUSE mirror
@@ -296,7 +296,7 @@ class ChamberApi:
         """-> {tar_b64: entries with mtime >= since, paths: every entry now, now: newest mtime}.
         Uses a host-side snapshot (docker cp), so the chamber needs no tar or python."""
         since = safe_num(p.get("since"), float)
-        with tempfile.TemporaryDirectory(prefix="vals-sync-") as d:
+        with tempfile.TemporaryDirectory(prefix="valve-sync-") as d:
             snap = Path(d) / "ws.tar"
             self.sandbox.snapshot(self.workspace, snap)
             out, paths, newest = io.BytesIO(), [], since
@@ -329,7 +329,7 @@ class ChamberApi:
             raise ValueError(f"deletes must be relative paths inside the workspace: {bad[:3]}")
         n = 0
         if raw:
-            with tempfile.TemporaryDirectory(prefix="vals-push-") as d:
+            with tempfile.TemporaryDirectory(prefix="valve-push-") as d:
                 with tarfile.open(fileobj=io.BytesIO(raw)) as tar:
                     tar.extractall(d, filter="data")
                     n = len(tar.getmembers())

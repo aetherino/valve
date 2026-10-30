@@ -3,6 +3,7 @@
 .env.*
 # local state
 .vals*/
+.valve*/
 workspaces/
 # original starter zip + extracted copy (benchmarks/ is copied from it unchanged)
 starter/

@@ -1,12 +1,16 @@
 # Francisco's Take-home assignment
 NOTE: This document is human-written; the Setup and Run sections were added, and the Phantom Box section updated, with Claude's help to match the current code.
 
+![Valve architecture](architecture.png)
+
+(Editable source: [architecture.excalidraw](architecture.excalidraw), open it at [excalidraw.com](https://excalidraw.com).)
+
 ## Setup
 
 **Requirements:** macOS or Linux, [Docker](https://docs.docker.com/get-docker/) with the daemon running (tested on Docker Desktop), and [uv](https://docs.astral.sh/uv/) (it fetches Python 3.11 itself). No Rust toolchain is needed: the phantom binary is built inside Docker.
 
 ```bash
-git clone <this repo> vals && cd vals
+git clone <this repo> valve && cd valve
 uv sync
 ```
 
@@ -72,11 +76,11 @@ Several workers can run at once (e.g. in two terminals); they share one queue.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `VALS_MAX_ACTIVE_TRIALS` | unset | cap on running trials across all workers (each trial runs ≤ 3 containers) |
-| `VALS_HOME` | `.vals/` | where the database and artifacts live |
-| `VALS_CHAMBER_API_BIND` / `VALS_CHAMBER_API_PUBLIC` | `127.0.0.1` / `host.docker.internal` | where the phantom box's Chamber API listens / what address the box dials |
+| `VALVE_MAX_ACTIVE_TRIALS` | unset | cap on running trials across all workers (each trial runs ≤ 3 containers) |
+| `VALVE_HOME` | `.valve/` | where the database and artifacts live |
+| `VALVE_CHAMBER_API_BIND` / `VALVE_CHAMBER_API_PUBLIC` | `127.0.0.1` / `host.docker.internal` | where the phantom box's Chamber API listens / what address the box dials |
 
-**Where results go:** `.vals/harness.db` (runs, trials, results, events) and one folder per try, `.vals/artifacts/<run>/<trial>/try<N>/`, holding `manifest.json`, `transcript.jsonl`, `agent_logs/`, `workspace.tar`, `verifier.log` and `result.json`.
+**Where results go:** `.valve/harness.db` (runs, trials, results, events) and one folder per try, `.valve/artifacts/<run>/<trial>/try<N>/`, holding `manifest.json`, `transcript.jsonl`, `agent_logs/`, `workspace.tar`, `verifier.log` and `result.json`.
 
 ## Eval harness: design philosofy
 **Best effort isolation**: I took the desing in the direction of making agents be able to be run inside their own sandboxes, given that some of the agents one might test would require dependencies not normally found inside the specified images.
@@ -143,5 +147,3 @@ My exploration on this problem is the Phantom Box: a container that runs a stock
 The chamber itself stays the untouched task image, offline, with no secrets: the API key and the network access live only in the phantom box.
 
 Today the box runs on the same Docker host as the worker, but nothing ties it there. Pointed at a reachable Chamber API (behind TLS), the same box could run on a vendor's own infrastructure. That would let a vendor run Vals benchmarks without sharing a secret harness, while Vals keeps the chamber, the tests and the grading on its side.
-
-Known gaps: one sync message is capped at 24 MB (big repos would need incremental sync or a FUSE mirror), and the box has bash while alpine chambers only have `sh`, which is flagged in the results rather than patched.

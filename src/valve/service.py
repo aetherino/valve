@@ -14,13 +14,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from vals_harness.installed import InstalledRunner
-from vals_harness.launchers import DockerLauncher
-from vals_harness.phantom import PhantomLauncher
-from vals_harness.sandbox.docker import DockerSandboxProvider, image_ids, remove_images, vals_images
-from vals_harness.specs import (Task, load_tasks, AgentSpec, BenchmarkSpec, RunSpec, TrialSpec, load_agent, load_benchmark,
+from valve.installed import InstalledRunner
+from valve.launchers import DockerLauncher
+from valve.phantom import PhantomLauncher
+from valve.sandbox.docker import DockerSandboxProvider, image_ids, remove_images, valve_images
+from valve.specs import (Task, load_tasks, AgentSpec, BenchmarkSpec, RunSpec, TrialSpec, load_agent, load_benchmark,
                                 missing_secrets, resolve_trials, trial_budget_s)
-from vals_harness.store import ACTIVE, Claim, Store
+from valve.store import ACTIVE, Claim, Store
 
 LEASE_S = 60
 FOLLOW_EVENTS = ("phase", "exec", "agent_finished", "infra_error")
@@ -44,7 +44,7 @@ class Paths:
     def from_root(cls, root: Path) -> Paths:
         root = root.resolve()
         load_dotenv(root / ".env")
-        return cls(root=root, home=Path(os.environ.get("VALS_HOME", root / ".vals")).resolve())
+        return cls(root=root, home=Path(os.environ.get("VALVE_HOME", root / ".valve")).resolve())
 
 
 def load_dotenv(path: Path) -> None:
@@ -101,9 +101,9 @@ class _Running:
 
 
 def max_active_trials() -> int | None:
-    """VALS_MAX_ACTIVE_TRIALS: global cap on running trials for this home (all workers).
+    """VALVE_MAX_ACTIVE_TRIALS: global cap on running trials for this home (all workers).
     Each trial runs at most 3 containers at once, so this also bounds live containers."""
-    v = os.environ.get("VALS_MAX_ACTIVE_TRIALS")
+    v = os.environ.get("VALVE_MAX_ACTIVE_TRIALS")
     return int(v) if v else None
 
 
@@ -147,14 +147,14 @@ def work(paths: Paths, *, slots: int = 1, run_id: str | None = None, stop_when_e
                 if r.proc.poll() is None:
                     if time.monotonic() > r.deadline:
                         _kill_group(r.proc)
-                        provider.reap({"vals.claim": token})
+                        provider.reap({"valve.claim": token})
                         _remove_job(r.result_path)
                         del running[token]
                         budget = trial_budget_s(r.claim.spec.limits)
                         record(r, _infra(r.claim, "timeout_harness", f"trial exceeded its {budget}s wall clock"))
                     continue
                 del running[token]
-                provider.reap({"vals.claim": token})  # in case the child died before its own cleanup
+                provider.reap({"valve.claim": token})  # in case the child died before its own cleanup
                 result = _read_result(r.result_path)
                 if result is None:
                     record(r, _infra(r.claim, "adapter", f"trial process exited ({r.proc.returncode}) without a result"))
@@ -191,7 +191,7 @@ def work(paths: Paths, *, slots: int = 1, run_id: str | None = None, stop_when_e
                 for token, r in list(running.items()):
                     if not store.heartbeat(r.claim.spec.trial_id, token, LEASE_S):
                         _kill_group(r.proc)
-                        provider.reap({"vals.claim": token})
+                        provider.reap({"valve.claim": token})
                         _remove_job(r.result_path)
                         del running[token]
             time.sleep(0.2)
@@ -199,7 +199,7 @@ def work(paths: Paths, *, slots: int = 1, run_id: str | None = None, stop_when_e
         restore()
         for token, r in running.items():  # only on Ctrl-C / SIGTERM / unexpected exit
             _kill_group(r.proc)
-            provider.reap({"vals.claim": token})
+            provider.reap({"valve.claim": token})
             result = _read_result(r.result_path)   # also removes the job files
             if result is not None and not result.get("lost_lease"):
                 record(r, result)                  # it finished just in time: keep it
@@ -238,7 +238,7 @@ def _spawn(paths: Paths, jobs_dir: Path, claim: Claim) -> _Running:
                                "try_no": claim.try_no, "db": str(paths.db), "artifacts": str(paths.artifacts),
                                "supervisor_pid": os.getpid()}))
     # Own session = own process group, so a timeout kills the child and everything it started.
-    proc = subprocess.Popen([sys.executable, "-m", "vals_harness.trial_child", str(job), str(result)],
+    proc = subprocess.Popen([sys.executable, "-m", "valve.trial_child", str(job), str(result)],
                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, start_new_session=True)
     return _Running(claim, proc, result, time.monotonic() + trial_budget_s(claim.spec.limits))
 
@@ -283,7 +283,7 @@ def _tags_for(agents: list[AgentSpec], benches: list[BenchmarkSpec], task_image_
         if agent.placement == "sidecar" and agent.root.is_dir():
             keep.add(DockerLauncher.tag_for(agent))
         elif agent.placement in ("installed", "phantom") and agent.root.is_dir():
-            # One layer (and one `vals/base:` tag) per task image; phantom adds one more on top.
+            # One layer (and one `valve/base:` tag) per task image; phantom adds one more on top.
             for image_id in task_image_ids:
                 installed = InstalledRunner.tag_for(agent, image_id)
                 keep |= {installed, InstalledRunner.base_tag(image_id)}
@@ -293,7 +293,7 @@ def _tags_for(agents: list[AgentSpec], benches: list[BenchmarkSpec], task_image_
         if bench.tooling_dockerfile and (bench.root / bench.tooling_dockerfile).is_file():
             keep.add(DockerSandboxProvider.tooling_tag(bench.root / bench.tooling_dockerfile))
         if bench.root.is_dir():
-            keep |= {t for t in (task_image_ref(bench, task) for task in _safe_tasks(bench)) if t.startswith("vals/")}
+            keep |= {t for t in (task_image_ref(bench, task) for task in _safe_tasks(bench)) if t.startswith("valve/")}
     return keep
 
 
@@ -324,7 +324,7 @@ def current_image_tags(paths: Paths, task_image_ids: set[str] | None = None) -> 
 def prune(paths: Paths, *, dry_run: bool = False) -> dict[str, list[str] | int]:
     """Remove harness images that nothing needs any more, and containers left by this
     home's dead workers. Kept: what the current agent/benchmark folders build; installed
-    layers (+ `vals/base:` tags) for the task images of every run in the DB; and every
+    layers (+ `valve/base:` tags) for the task images of every run in the DB; and every
     image a queued or running trial needs, even if its agent lives outside agents/.
     Images in use by a container are kept too (Docker refuses)."""
     store = Store(paths.db)
@@ -334,7 +334,7 @@ def prune(paths: Paths, *, dry_run: bool = False) -> dict[str, list[str] | int]:
     pending = [s for status, s in specs if status == "queued" or status in ACTIVE]
     keep = current_image_tags(paths, task_ids) | _tags_for([s.agent for s in pending],
                                                            [s.benchmark for s in pending], task_ids)
-    stale = sorted(set(vals_images()) - keep)
+    stale = sorted(set(valve_images()) - keep)
     containers = 0
     refused: list[str] = []
     if not dry_run:

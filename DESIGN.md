@@ -1,4 +1,4 @@
-# Vals Agentic Harness — Design Spec (draft v1)
+# Valve — Agentic Harness Design Spec (draft v1)
 
 Status: draft for discussion. **(proposed)** marks decisions still open to change; §15 lists open questions. Diagram: `architecture.excalidraw`.
 
@@ -8,7 +8,7 @@ Status: draft for discussion. **(proposed)** marks decisions still open to chang
 2. **Grade outcomes, record everything.** Scores come from the final workspace, not from what the agent says. Every action and model call is kept for transcript analysis.
 3. **Separate the brain from the hands.** The agent decides; the harness executes. Agents act only through the Chamber API, at the tool level, never with direct access to the chamber.
 4. **Agent code never sits next to privilege.** Third-party agent code runs in its own container, never in the worker process that holds Docker and the DB.
-5. **Protocol first, transport later.** Everything between harness and agent is a versioned message (`vals-agent/1`). Stdio today, WebSocket tomorrow; nothing depends on shared files or local processes.
+5. **Protocol first, transport later.** Everything between harness and agent is a versioned message (`valve-agent/1`). Stdio today, WebSocket tomorrow; nothing depends on shared files or local processes.
 6. **Ports and adapters.** Every external dependency sits behind an interface with one v1 implementation (§5.3). Growth = new implementation, not a core change.
 7. **Each party owns its config.** Benchmark authors own BenchmarkSpec, agent authors own AgentSpec, the experimenter owns RunSpec. They merge into a frozen manifest that can reproduce the trial.
 8. **Honest numbers.** Agent failures count; harness failures are retried and excluded — and nothing an agent does can make its failure look like a harness failure. Accuracy is reported with error bars over repeated attempts, the way Vals reports.
@@ -49,11 +49,11 @@ Status: draft for discussion. **(proposed)** marks decisions still open to chang
 | Remote agents | Tool-level protocol (+ MCP/ACP adapters later) | Networked filesystem | Split-brain runtimes, latency, POSIX edge cases |
 | Names | `Sandbox` / chamber / Chamber API | `Environment` / Env API | "Environment" collided with env vars and mini's own term |
 | Agent stops its own chamber (`kill 1`, `pkill tail`, `kill -9 -1`) | Graded: `ChamberStopped`, session ends, stopped container still snapshotted (`docker cp` works on it) | infra_error (`rc != 0 and not alive()`) | Review: an agent could exclude any failing trial by stopping its chamber. Docker's own records decide: container still exists, `exited`, no `kill`/`stop` event (API-initiated stops leave one), not stopped by the harness, exit ≠ 255 → the agent's. The same rule grades a submission that kills the *verifier's* PID 1 (saboteur agent) |
-| Reaping scope | Every container labeled `vals.home=<hash of the DB path>`; `reap_stale` filters by it | `vals.managed=1` + this DB's live claims | A worker, prune or pytest with another `VALS_HOME` deleted other homes' live trials |
-| Installed CLI output | stdout is the exec's own output, streamed to a host file; every number sanitized; any parse failure → agent_error | `> /tmp/vals/output.jsonl` in the chamber, read back with `get` | The agent can rewrite a chamber file; malformed `usage`/`total_cost_usd`/`num_turns` crashed the parser → infra_error |
+| Reaping scope | Every container labeled `valve.home=<hash of the DB path>`; `reap_stale` filters by it | `valve.managed=1` + this DB's live claims | A worker, prune or pytest with another `VALVE_HOME` deleted other homes' live trials |
+| Installed CLI output | stdout is the exec's own output, streamed to a host file; every number sanitized; any parse failure → agent_error | `> /tmp/valve/output.jsonl` in the chamber, read back with `get` | The agent can rewrite a chamber file; malformed `usage`/`total_cost_usd`/`num_turns` crashed the parser → infra_error |
 | Provider failures | infra_error kind `model_api` (retried), only when clearly the provider's *and* before the agent acted: Claude Code `is_error` result matching an API/auth/rate-limit/overload pattern with no `tool_use` before it; a sidecar's `finish(model_error)` with zero chamber commands | Graded 0 | A bad key or an outage scored as agent failures. Once the agent has run a tool it could forge the line (it can write to the CLI's stdout) or an adapter could use it to dodge a hard task, so after that it's graded |
 | Missing secrets | Required `secrets` checked at submit (nothing queued) and in PREPARE (InfraError `config`); `optional_secrets` for the rest | Silently skipped | An unset `ANTHROPIC_API_KEY` produced a run of 0 scores |
-| Sidecar image at launch | Pinned image id from `prepare()`, `docker run --pull never`; `docker run` exit 125/126/127 before `hello` → infra_error | Tag; any exit → agent_error | A missing tag would pull a squattable `vals/agent-…` from Docker Hub; a daemon error / name conflict is not the agent's. Before `hello` the agent hasn't seen the task, so this can't be used to dodge one |
+| Sidecar image at launch | Pinned image id from `prepare()`, `docker run --pull never`; `docker run` exit 125/126/127 before `hello` → infra_error | Tag; any exit → agent_error | A missing tag would pull a squattable `valve/agent-…` from Docker Hub; a daemon error / name conflict is not the agent's. Before `hello` the agent hasn't seen the task, so this can't be used to dodge one |
 | Spend on timeout | Numbers from a `finish` sent during the cancel grace are kept (watchdog only overrides the status); installed without a `result` event sums the assistant events' token usage | Outcome replaced with zeros | Timed-out trials recorded $0 spend |
 | Supervisor shutdown | SIGTERM/SIGHUP take the Ctrl-C path; each trial child watches its parent and, if it's gone, reaps its claim's containers and releases the trial | Default signal handling | SIGTERM skipped `finally`; children (own sessions) and their containers outlived the worker and kept spending |
 | Inputs drift | `folder_digest` of the agent and benchmark folders recomputed in PREPARE; mismatch → infra_error `adapter` ("inputs changed since submit") | Trust the digest from submit | The trial ran whatever was in the folders at claim time, under the manifest of what was submitted |
@@ -230,8 +230,8 @@ JSON-RPC 2.0, newline-delimited. W = worker, A = agent.
 
 | Step | Direction | Message | Payload |
 |---|---|---|---|
-| 1 | A → W | `hello` (request) | `{protocol: "vals-agent/1", agent: {name, version}, capabilities: ["exec", "files", "events"]}` |
-| 2 | W → A | `hello` result | `{protocol: "vals-agent/1", trial_id}` — mismatched major version → `agent_error` (graded 0: the agent's adapter is wrong) |
+| 1 | A → W | `hello` (request) | `{protocol: "valve-agent/1", agent: {name, version}, capabilities: ["exec", "files", "events"]}` |
+| 2 | W → A | `hello` result | `{protocol: "valve-agent/1", trial_id}` — mismatched major version → `agent_error` (graded 0: the agent's adapter is wrong) |
 | 3 | W → A | `start` (notification) | `{instruction, config: {model, step_limit, cost_limit_usd, …}, workspace: "/workspace", deadline_unix, chamber: {uname}}` — `chamber.uname` so an agent needn't spend a chamber command on it before its first model call |
 | 4 | A → W | `exec` / `put` / `get` (requests) | Chamber API (§5.1) |
 | 4 | A → W | `event` (notification, optional) | `{type, data}` — progress, step summaries, model usage; streamed into the `events` table |
@@ -252,7 +252,7 @@ Each seam is an interface with one v1 implementation. Making agents remote, or m
 |---|---|---|---|
 | `Transport` | Carry protocol messages: `send(msg)`, `recv() -> msg`, `close()` | `StdioTransport` (pipes of `docker run -i`) | `WebSocketTransport` (TLS + per-trial bearer token), `HttpLongPollTransport` |
 | `AgentLauncher` | Start an agent for a trial and hand back a session: `launch(agent_spec, trial) -> AgentSession`; `AgentSession` = transport + `wait()` + `kill()` | `DockerLauncher` (sidecar), `HostLauncher` (dev); installed agents use `InstalledRunner` (no session: the CLI is driven with `Sandbox.exec`) | `RemoteLauncher`: POST to the vendor's `/sessions`, get a WebSocket URL, agent dials back |
-| Agent session protocol | Handshake, task, actions, events, artifacts, finish (§5.2) | `vals-agent/1` | additive methods; major bump only for breaking changes |
+| Agent session protocol | Handshake, task, actions, events, artifacts, finish (§5.2) | `valve-agent/1` | additive methods; major bump only for breaking changes |
 | `SandboxProvider` | Create chambers and verifiers: `create(image, limits, network, labels) -> Sandbox` | `DockerSandboxProvider` | Modal, Daytona, Firecracker, remote Docker host |
 | `Sandbox` | Act on one sandbox: `exec`, `put`, `get`, `snapshot`, `stop` | `DockerSandbox` | one per `SandboxProvider` |
 | `ModelGateway` | How an agent reaches its model: `credentials_for(trial) -> {base_url, api_key}` | `DirectGateway` (pass the declared secret) | `ProxyGateway`: host proxy, per-trial scoped key, logs every model call; remote agents bringing their own model just report usage in `finish` |
@@ -266,7 +266,7 @@ Each seam is an interface with one v1 implementation. Making agents remote, or m
  worker ──RemoteLauncher──▶ vendor API: POST /sessions {trial_id, token}
    ▲                                         │
    └──────── WebSocketTransport ◀────────────┘ agent dials back with token
-             same vals-agent/1 messages: hello · start · exec/put/get · event · artifact · finish
+             same valve-agent/1 messages: hello · start · exec/put/get · event · artifact · finish
 ```
 
 The vendor's code never enters our infrastructure and our chamber never leaves it. The agent only ever sees protocol messages. Only `RemoteLauncher` and `WebSocketTransport` are new; the protocol, Chamber API, grading and results are unchanged.
@@ -299,18 +299,18 @@ Stock Claude Code in its own box that mirrors the chamber, so the chamber stays 
  ┌───────────────────────────────────────────────────────┐  TCP + token  ┌──────────────────────┐ docker ┌─────────────────────────┐
  │ phantom run ── claude -p …   own copy of the workspace│ ────────────▶ │ Chamber API          │ ─exec─▶│ eval '<cmd>'; report cwd│
  │   ▲ unix socket     Read/Edit/Glob/Grep act locally   │  JSON-RPC     │  exec · sync_pull    │ docker │                         │
- │ /bin/sh, /bin/bash = phantom shell                    │  vals-agent/1 │  sync_push · finish  │ ─cp───▶│ /app or /workspace      │
+ │ /bin/sh, /bin/bash = phantom shell                    │  valve-agent/1 │  sync_push · finish  │ ─cp───▶│ /app or /workspace      │
  └───────────────────────────────────────────────────────┘               └──────────────────────┘        └─────────────────────────┘
 ```
 
-- **Network link (default, `link: network`).** Per trial the worker opens a listener (`netlink.py`) and a one-time token; the box dials `host:port`, presents the token (env, never argv) and then speaks plain vals-agent/1. `ChamberApi` is unchanged. Defaults are local and safe: bind `127.0.0.1` (Docker Desktop routes `host.docker.internal` to host loopback, verified), never exposed to the LAN. For a remote box: `VALS_CHAMBER_API_BIND` / `VALS_CHAMBER_API_PUBLIC` and TLS in front (the token authenticates, it doesn't encrypt).
+- **Network link (default, `link: network`).** Per trial the worker opens a listener (`netlink.py`) and a one-time token; the box dials `host:port`, presents the token (env, never argv) and then speaks plain valve-agent/1. `ChamberApi` is unchanged. Defaults are local and safe: bind `127.0.0.1` (Docker Desktop routes `host.docker.internal` to host loopback, verified), never exposed to the LAN. For a remote box: `VALVE_CHAMBER_API_BIND` / `VALVE_CHAMBER_API_PUBLIC` and TLS in front (the token authenticates, it doesn't encrypt).
 - **Workspace mirror at command boundaries** (`phantom/src/sync.rs`), instead of a shared or networked filesystem:
   - start: pull the whole workspace (the simplest prefetch);
   - every relayed command: push the box's edits (Claude's Write/Edit act locally) → exec in the chamber → pull what changed;
   - agent exits: push once more.
 
   Detection is a local (mtime, size) scan; pulls return entries changed since the last pull plus the full path list (deletions). Two Chamber API methods: `sync_pull` (host-side `docker cp` snapshot, so the chamber needs no tools) and `sync_push` (tar members through the data filter; deletes must be relative). Syncs are serialized, so parallel tool calls see a consistent tree. Limit: 24 MB per sync message; larger repos need incremental or FUSE (v2).
-- **cwd tracking without a shared /tmp.** Claude reads its cwd file locally, so the phantom shell rewrites `… && pwd -P >| /tmp/claude-XXXX-cwd` into `…; rc=$?; [ $rc -eq 0 ] && printf '\n__VALS_CWD__%s\n' "$(pwd -P)"; exit $rc`, strips the marker from the output, and writes the file in the box.
+- **cwd tracking without a shared /tmp.** Claude reads its cwd file locally, so the phantom shell rewrites `… && pwd -P >| /tmp/claude-XXXX-cwd` into `…; rc=$?; [ $rc -eq 0 ] && printf '\n__VALVE_CWD__%s\n' "$(pwd -P)"; exit $rc`, strips the marker from the output, and writes the file in the box.
 - **One Rust binary** (`phantom/`, static musl). As `phantom run` it's the box's runner: connects (stdio or TCP), starts the CLI with the instruction on stdin, serves phantom shells on a unix socket, syncs, then sends the CLI's stream-json as an artifact and `finish` (incl. the final answer). As `sh`/`bash` it relays the command to the runner.
 - **What Claude Code sends its shell** (from a spike that logged every invocation): startup probes (`uname`, `env`) → run in the chamber, so the agent sees the chamber's OS; a shell snapshot (`bash -c -l "SNAPSHOT_FILE=…"`) → runs locally with the real bash; per tool call `source <snapshot> … && eval '<CMD>' … && pwd -P >| <cwd file>` → the bash-only prefix is dropped and the POSIX tail forwarded, so alpine chambers work.
 - **The phantom shell never forwards its environment**, so the API key stays in the box. Runner output and Claude's config live in box-only paths.
@@ -337,7 +337,7 @@ name: python-tasks
 version: "1"
 dataset: dataset.json
 fields: { id: id, instruction: prompt, image: docker_image }
-tooling_image: vals/python-tasks-tooling   # built from python:3.11-slim + pytest; used for prepare + verify
+tooling_image: valve/python-tasks-tooling   # built from python:3.11-slim + pytest; used for prepare + verify
 prepare: ["python", "prepare.py", "{task_id}", "--workspace", "/out"]
 eval_paths: ["test_solution.py"]           # moved from visible/ to eval/
 submission_paths: ["solution.py"]          # only these agent files reach the verifier ("**" = all)
@@ -408,7 +408,7 @@ installed:
     claude -p --output-format stream-json --verbose --model {model} --max-turns {max_turns}
     --allowedTools "Bash Read Write Edit Glob Grep"
   env:
-    CLAUDE_CONFIG_DIR: /tmp/vals/agent      # session logs, outside /workspace, kept as an artifact
+    CLAUDE_CONFIG_DIR: /tmp/valve/agent      # session logs, outside /workspace, kept as an artifact
     ANTHROPIC_CUSTOM_HEADERS: "anthropic-workspace-id: ${ANTHROPIC_WORKSPACE_ID}"   # only if set
   output_parser: claude_stream_json
 secrets: [ANTHROPIC_API_KEY]
@@ -416,8 +416,8 @@ defaults: { model: claude-opus-5-5, step_limit: 50 }   # step_limit -> --max-tur
 ```
 
 How installed agents run (`installed.py`):
-- **Runtime as an image layer, never installed live.** `install.Dockerfile` is built `FROM` the pinned task image (tagged `vals/base:<id>` so it can't move), cached by a hash of the whole agent folder (the build context) + the task image id, and pinned as `agent_image`. The chamber is created from it. Alpine (apk, musl) and Debian (apt) both work.
-- **Driven from the worker with `Sandbox.exec`**: instruction written to `/tmp/vals/instruction.txt` and piped on stdin. The CLI's stdout is the exec's own output, streamed to `agent_logs/output.jsonl` on the host as it's produced (capped at 50 MB), so the agent can't rewrite it afterwards. Parsed: `tool_use` events → transcript; the last `result` event → exit status, turns, tokens incl. cache, cost. Every number is sanitized and any parse failure is `agent_error`. No `result` (killed at the wall clock) → tokens summed from the assistant events (cost unknown, recorded as 0). An `is_error` result that is recognizably the provider's (API error 401/403/404/408/429/5xx, auth/permission/rate-limit/overload errors, invalid key, no credit) before any `tool_use` → `model_error` → infra_error `model_api`.
+- **Runtime as an image layer, never installed live.** `install.Dockerfile` is built `FROM` the pinned task image (tagged `valve/base:<id>` so it can't move), cached by a hash of the whole agent folder (the build context) + the task image id, and pinned as `agent_image`. The chamber is created from it. Alpine (apk, musl) and Debian (apt) both work.
+- **Driven from the worker with `Sandbox.exec`**: instruction written to `/tmp/valve/instruction.txt` and piped on stdin. The CLI's stdout is the exec's own output, streamed to `agent_logs/output.jsonl` on the host as it's produced (capped at 50 MB), so the agent can't rewrite it afterwards. Parsed: `tool_use` events → transcript; the last `result` event → exit status, turns, tokens incl. cache, cost. Every number is sanitized and any parse failure is `agent_error`. No `result` (killed at the wall clock) → tokens summed from the assistant events (cost unknown, recorded as 0). An `is_error` result that is recognizably the provider's (API error 401/403/404/408/429/5xx, auth/permission/rate-limit/overload errors, invalid key, no credit) before any `tool_use` → `model_error` → infra_error `model_api`.
 - **The agent can stop the chamber** (its tools run as root next to PID 1). That's `ChamberStopped`: the outcome is `agent_error`, the streamed output and logs are still collected (`docker cp` works on a stopped container), and the workspace is graded.
 - **Root, without skipping permissions.** Claude Code refuses `--dangerously-skip-permissions` as root (and 2.1.312 ignores `IS_SANDBOX`), so its tools are pre-approved with `--allowedTools`. The chamber stays root, as the task expects.
 - **Secrets** travel as `docker exec -e NAME` through the CLI's own environment, never argv. They are visible to the agent inside the chamber (v1 risk, documented; v2 model proxy with a dummy key), and to anyone with Docker access on the host (`docker inspect` of the exec).
@@ -454,7 +454,7 @@ The fully resolved RunSpec for one `(task_id, attempt)`, plus `inputs_digest`: c
 ```
 harness worker --slots 4                      (supervisor; the only writer of final results)
    │  loop: collect finished children → fill free slots (claim) → renew leases every 10 s
-   ├─ slot 1 → python -m vals_harness.trial_child <job> <result>   ─▶ tooling → chamber + agent → verifier
+   ├─ slot 1 → python -m valve_harness.trial_child <job> <result>   ─▶ tooling → chamber + agent → verifier
    ├─ slot 2 → …                                  (own process group; result written atomically to a file)
    └─ trial wall clock: kill process group + reap by claim label → infra_error (timeout_harness)
 ```
@@ -464,10 +464,10 @@ harness worker --slots 4                      (supervisor; the only writer of fi
 - **Clean shutdown.** On Ctrl-C, SIGTERM or SIGHUP the supervisor kills its children, reaps their containers and *releases* their claims back to the queue (fenced, no infra attempt charged); a child that had already written its result is recorded instead. If the supervisor dies without cleaning up (SIGKILL), each child notices its parent is gone (polls `getppid()`), reaps its claim's containers, releases the trial and exits, so nothing keeps running or spending unsupervised. Job files (`jobs/*.json`) are removed however a trial ends.
 - **Multiple workers are fine.** Each claims atomically from SQLite (WAL mode). Multi-host would need Postgres; out of scope.
 - **Leases.** A claimed trial has `lease_until`, renewed every 10 s. An expired lease (dead worker) lets another worker reclaim it, counting one infra attempt; past `policy.infra_retries` the trial is closed as `infra_error` (`worker_lost`) instead of being handed out forever.
-- **Fencing tokens.** Every claim gets a fresh `claim_token`; every later write (`set_status`, `heartbeat`, `finish`) must present it. A worker that stalled past its lease is fenced out: its writes fail (`LostLease`), its result is dropped, and because containers and artifact folders are per claim (`vals.claim` label, `try<N>/` folder) it can't delete or overwrite the new owner's.
-- **Startup reaper.** A worker removes containers of *its own home* (`vals.home` = hash of the DB path) whose claim isn't live (`reap_stale`). Another `VALS_HOME` (a second checkout, a test run) never touches them.
+- **Fencing tokens.** Every claim gets a fresh `claim_token`; every later write (`set_status`, `heartbeat`, `finish`) must present it. A worker that stalled past its lease is fenced out: its writes fail (`LostLease`), its result is dropped, and because containers and artifact folders are per claim (`valve.claim` label, `try<N>/` folder) it can't delete or overwrite the new owner's.
+- **Startup reaper.** A worker removes containers of *its own home* (`valve.home` = hash of the DB path) whose claim isn't live (`reap_stale`). Another `VALVE_HOME` (a second checkout, a test run) never touches them.
 - **The worker loop never dies on a trial.** Any exception becomes that trial's `infra_error`; cleanup (`reap`) never raises.
-- **Global cap** `VALS_MAX_ACTIVE_TRIALS`: trials running under live leases across all workers of a home, checked inside the claim transaction. A trial runs at most 3 containers at once (tooling/verifier, chamber, agent box), so this bounds live containers. Measured: 2 workers × 2 slots with a cap of 3 → peak 3 active trials, 6 live containers; 16 mixed trials (mini-swe-agent sidecar + Claude Code phantom) in 67 s.
+- **Global cap** `VALVE_MAX_ACTIVE_TRIALS`: trials running under live leases across all workers of a home, checked inside the claim transaction. A trial runs at most 3 containers at once (tooling/verifier, chamber, agent box), so this bounds live containers. Measured: 2 workers × 2 slots with a cap of 3 → peak 3 active trials, 6 live containers; 16 mixed trials (mini-swe-agent sidecar + Claude Code phantom) in 67 s.
 - **`--follow`** (`run --wait --follow`, `worker --follow`) prints each chamber command and phase as it happens.
 - **Optional:** a per-model concurrency cap to stay under provider rate limits.
 
@@ -551,8 +551,8 @@ The run report is a SQL aggregation over `runs ⋈ trials ⋈ results`.
 - Secrets never enter the chamber for sidecar agents. Installed agents receive only their declared `secrets` / `optional_secrets`. Either way they are visible to anyone with Docker access on the host: `docker inspect` shows a sidecar's `Config.Env`, and an installed agent's exec environment (v2: model proxy with per-trial keys).
 - Workspace moves via `docker cp` / tar, not bind mounts.
 - Eval files absent from the chamber by default; always re-overlaid at verify.
-- Containers labeled `vals.trial_id`, `vals.run_id`, `vals.claim`, `vals.home`; reaped per claim in `finally`, and per home on worker start / `harness prune`.
-- The sidecar runs from its pinned image id with `--pull never`: nothing is ever pulled from a registry under a `vals/…` name.
+- Containers labeled `valve.trial_id`, `valve.run_id`, `valve.claim`, `valve.home`; reaped per claim in `finally`, and per home on worker start / `harness prune`.
+- The sidecar runs from its pinned image id with `--pull never`: nothing is ever pulled from a registry under a `valve/…` name.
 - Every sandbox is hardened: `--init` (reaps zombies), `--pids-limit 512`, `--security-opt no-new-privileges`, `--cap-drop ALL` plus only the file-ownership caps tasks need (CHOWN, DAC_OVERRIDE, FOWNER, FSETID, SETUID, SETGID, KILL). Disk isn't capped: overlay2 on Docker Desktop doesn't support `--storage-opt size`.
 - Host memory is bounded: exec output streams with a 1 MB cap, `get` 10 MB, snapshot 1 GB (streamed to disk), protocol messages 32 MB.
 - Agent snapshots are unpacked with tarfile's `data` filter; rejected members and links escaping the workspace are dropped and listed in the grade's `harness.skipped_files`.
@@ -565,7 +565,7 @@ harness run --agent agents/mini-swe-agent --benchmark bash-operations [--task_id
 harness status [--run_id ID]        # no id → list active runs
 harness results --run_id ID [--format json|table|summary]
 harness worker [--slots N] [--once]
-harness prune [--dry-run]          # unneeded vals/* images + this home's dead workers' containers
+harness prune [--dry-run]          # unneeded valve/* images + this home's dead workers' containers
 harness cancel --run_id ID
 ```
 
@@ -601,10 +601,10 @@ They run as sidecar containers like any other agent; a further integration test 
 ## 14. Repo layout and image builds
 
 ```
-vals-harness/
-├── src/vals_harness/       cli.py · service.py · specs.py · sandbox/ (Sandbox, docker.py) · benchmarks.py · protocol.py
+valve-harness/
+├── src/valve_harness/       cli.py · service.py · specs.py · sandbox/ (Sandbox, docker.py) · benchmarks.py · protocol.py
 │                           launchers.py · chamber_api.py · netlink.py · installed.py · phantom.py · trial.py · trial_child.py · store.py · results.py · errors.py
-├── src/vals_agent_sdk/     client.py (agent side of vals-agent/1, stdlib only)
+├── src/valve_agent_sdk/     client.py (agent side of valve-agent/1, stdlib only)
 ├── phantom/                Rust: phantom runner + phantom shell
 ├── agents/                 mini-swe-agent/ · claude-code/ · claude-code-phantom/ · oracle/ · noop/ · cheater/ · vandal/ · saboteur/
 ├── benchmarks/             bash-operations/ · python-tasks/ (starter, untouched + harness.yaml) · system-tasks/ (task folders)
@@ -614,9 +614,9 @@ vals-harness/
 └── README.md · DESIGN.md · architecture.excalidraw
 ```
 
-- Agent and tooling images are built from their folders, tagged by a hash of the folder contents (`vals/agent-mini-swe-agent:<hash>`; installed layers: agent folder + task image id). They are built in PREPARE, at claim time, if missing (there is no `harness build`; the first trial of a new version pays for the build inside its trial budget, §7).
+- Agent and tooling images are built from their folders, tagged by a hash of the folder contents (`valve/agent-mini-swe-agent:<hash>`; installed layers: agent folder + task image id). They are built in PREPARE, at claim time, if missing (there is no `harness build`; the first trial of a new version pays for the build inside its trial budget, §7).
 - Task images are pulled once and pinned by id in each manifest.
-- `harness prune` removes `vals/*` images nothing needs: it keeps what the current agent/benchmark folders build, installed layers and `vals/base:` tags for the task images of every run in the DB, and every image a queued or running trial needs (even an agent outside `agents/`); Docker refuses to remove images a container still uses.
+- `harness prune` removes `valve/*` images nothing needs: it keeps what the current agent/benchmark folders build, installed layers and `valve/base:` tags for the task images of every run in the DB, and every image a queued or running trial needs (even an agent outside `agents/`); Docker refuses to remove images a container still uses.
 
 ## 15. Open questions
 

@@ -26,7 +26,7 @@ from minisweagent.agents.default import DefaultAgent  # noqa: E402
 from minisweagent.exceptions import Submitted  # noqa: E402
 from minisweagent.models import get_model  # noqa: E402
 
-from vals_agent_sdk.client import AgentClient  # noqa: E402
+from valve_agent_sdk.client import AgentClient  # noqa: E402
 
 SUBMIT_MARKER = "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
 
@@ -81,7 +81,7 @@ class ChamberEnvironment:
     def serialize(self) -> dict[str, Any]:
         return {"info": {"config": {
             "environment": {"cwd": self.cwd, "env": self.env, "timeout": self.timeout},
-            "environment_type": "vals.ChamberEnvironment",
+            "environment_type": "valve.ChamberEnvironment",
         }}}
 
 

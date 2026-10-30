@@ -13,12 +13,12 @@ installed:
     --model {model} --max-turns {max_turns}
     --allowedTools "Bash Read Write Edit Glob Grep"
   env:
-    CLAUDE_CONFIG_DIR: /tmp/vals/agent          # session logs land here, outside /workspace
+    CLAUDE_CONFIG_DIR: /tmp/valve/agent          # session logs land here, outside /workspace
     USE_BUILTIN_RIPGREP: "0"                    # use the image's ripgrep (needed on musl/alpine)
     DISABLE_AUTOUPDATER: "1"
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
     ANTHROPIC_CUSTOM_HEADERS: "anthropic-workspace-id: ${ANTHROPIC_WORKSPACE_ID}"   # only if set
-  logs_dir: /tmp/vals/agent
+  logs_dir: /tmp/valve/agent
   output_parser: claude_stream_json
 secrets: [ANTHROPIC_API_KEY]
 expects: [bash]   # met by the install layer, which adds bash to the chamber

@@ -170,7 +170,7 @@ def load_tasks(bench: BenchmarkSpec) -> list[Task]:
         f = bench.fields
         assert f is not None
         return [Task(id=r[f.id], instruction=r[f.instruction], image=r[f.image]) for r in rows]
-    from vals_harness.benchmarks import make_benchmark   # adapters live with the grading code
+    from valve.benchmarks import make_benchmark   # adapters live with the grading code
     return make_benchmark(bench, provider=None).tasks()
 
 
@@ -183,7 +183,7 @@ class InstalledRuntime(Frozen):
     dockerfile: str = "install.Dockerfile"  # in the agent folder; `ARG BASE` / `FROM ${BASE}`
     run: str                                # shell command; placeholders {model} {max_turns}; stdin = instruction
     env: dict[str, str] = {}                # extra env; "${VAR}" expands from the worker's env (skipped if unset)
-    logs_dir: str = "/tmp/vals/agent"       # copied out as an artifact after the run
+    logs_dir: str = "/tmp/valve/agent"       # copied out as an artifact after the run
     output_parser: Literal["claude_stream_json"]
 
 

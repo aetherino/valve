@@ -11,7 +11,7 @@
 7. Prints Docker's error text to look like a broken chamber (-> excluded as infra).
 Never solves the task.
 """
-from vals_agent_sdk.client import AgentClient
+from valve_agent_sdk.client import AgentClient
 
 FAKE_PYTEST = "import sys\nprint('1 passed')\nsys.exit(0)\n"
 FAKE_CONFTEST = '''import pytest

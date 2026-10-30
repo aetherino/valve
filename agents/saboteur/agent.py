@@ -9,7 +9,7 @@ Before that it plants a solution.py that kills the *verifier's* PID 1 when impor
 (python-tasks' grader imports it). After the chamber is gone it tries one more
 command (expects error -32003) and finishes with numbers the harness must keep.
 """
-from vals_agent_sdk.client import AgentClient, ChamberError
+from valve_agent_sdk.client import AgentClient, ChamberError
 
 ATTACKS = [
     "kill 1; sleep 5",

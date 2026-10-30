@@ -14,7 +14,7 @@ import statistics
 from collections import defaultdict
 from typing import Any
 
-from vals_harness.store import TERMINAL, Store
+from valve.store import TERMINAL, Store
 
 
 def _sem(xs: list[float]) -> float | None:

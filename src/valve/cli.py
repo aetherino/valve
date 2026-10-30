@@ -8,10 +8,10 @@ from typing import Any
 
 import click
 
-from vals_harness import results as results_mod
-from vals_harness import service
-from vals_harness.specs import LIMIT_KEYS, Policy, RunSpec
-from vals_harness.store import Store
+from valve import results as results_mod
+from valve import service
+from valve.specs import LIMIT_KEYS, Policy, RunSpec
+from valve.store import Store
 
 root_option = click.option("--root", type=click.Path(file_okay=False, path_type=Path), default=".",
                            show_default=True, help="Folder containing benchmarks/ and agents/.")

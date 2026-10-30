@@ -3,14 +3,14 @@
 The agent box (phantom, or any remote agent) dials in instead of talking over a
 container's stdio, so it can run anywhere that can reach the worker: a container on
 this machine, or a vendor's own infrastructure. The protocol on the connection is the
-same newline-delimited vals-agent/1, so ChamberApi doesn't change.
+same newline-delimited valve-agent/1, so ChamberApi doesn't change.
 
     worker: listen on BIND:0 -> token -> hand the box (address, token) -> accept one
             connection whose first line is {"token": ...} -> StdioTransport on the socket
 
 Defaults are local: bind 127.0.0.1 (never exposed to the LAN; Docker Desktop still
 routes host.docker.internal to it) and tell the box to dial host.docker.internal.
-For a remote box set VALS_CHAMBER_API_BIND / VALS_CHAMBER_API_PUBLIC and put TLS in
+For a remote box set VALVE_CHAMBER_API_BIND / VALVE_CHAMBER_API_PUBLIC and put TLS in
 front (a reverse proxy); the token alone authenticates, it doesn't encrypt.
 """
 
@@ -24,16 +24,16 @@ import socket
 import time
 from typing import Callable
 
-from vals_harness.errors import InfraError
-from vals_harness.protocol import StdioTransport
+from valve.errors import InfraError
+from valve.protocol import StdioTransport
 
 AUTH_TIMEOUT_S = 10
 
 
 class TrialListener:
     def __init__(self) -> None:
-        self.bind = os.environ.get("VALS_CHAMBER_API_BIND", "127.0.0.1")
-        self.public_host = os.environ.get("VALS_CHAMBER_API_PUBLIC", "host.docker.internal")
+        self.bind = os.environ.get("VALVE_CHAMBER_API_BIND", "127.0.0.1")
+        self.public_host = os.environ.get("VALVE_CHAMBER_API_PUBLIC", "host.docker.internal")
         self.token = secrets.token_hex(24)
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.bind((self.bind, 0))

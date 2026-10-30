@@ -7,11 +7,11 @@ import textwrap
 import pytest
 from pydantic import ValidationError
 
-from vals_harness import service
-from vals_harness.benchmarks import make_benchmark, parse_reward
-from vals_harness.results import summarize
-from vals_harness.specs import RunSpec, Task, load_benchmark, load_tasks
-from vals_harness.store import Store
+from valve import service
+from valve.benchmarks import make_benchmark, parse_reward
+from valve.results import summarize
+from valve.specs import RunSpec, Task, load_benchmark, load_tasks
+from valve.store import Store
 
 
 # ---------------------------------------------------------------- unit
@@ -43,7 +43,7 @@ def test_task_validation():
 
 
 def test_task_limits_override_agent_defaults_and_run_overrides_win(root):
-    from vals_harness.specs import resolve_trials
+    from valve.specs import resolve_trials
     run = RunSpec(agent="agents/oracle", benchmark="system-tasks", task_ids=["sys-003-path"])
     (t,) = resolve_trials(run, "r1", root, "test")
     assert t.limits.verify_timeout_s == 30                              # from task.toml
@@ -54,8 +54,8 @@ def test_task_limits_override_agent_defaults_and_run_overrides_win(root):
 
 
 ADAPTER = '''
-from vals_harness.benchmarks import Grade, PreparedTask
-from vals_harness.specs import Task
+from valve.benchmarks import Grade, PreparedTask
+from valve.specs import Task
 
 class QA:
     """Answers graded on the agent's final message: no files, no tests in a container."""
@@ -97,14 +97,14 @@ def test_python_adapter_hook(tmp_path):
 def _agent(tmp_path, name, body):
     folder = tmp_path / name
     folder.mkdir()
-    (folder / "agent.py").write_text("from vals_agent_sdk.client import AgentClient\nc = AgentClient('x', '1')\n"
+    (folder / "agent.py").write_text("from valve_agent_sdk.client import AgentClient\nc = AgentClient('x', '1')\n"
                                      + textwrap.dedent(body))
     (folder / "agent.yaml").write_text(f"name: {name}\nplacement: sidecar\ncommand: [python, agent.py]\n")
     return folder
 
 
 def _run(root, tmp_path, monkeypatch, agent, benchmark, task_ids=None):
-    monkeypatch.setenv("VALS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("VALVE_HOME", str(tmp_path / "home"))
     paths = service.Paths.from_root(root)
     run_id = service.submit(paths, RunSpec(agent=str(agent), benchmark=str(benchmark), task_ids=task_ids))
     service.work(paths, run_id=run_id, slots=3)
@@ -166,8 +166,8 @@ def test_build_lock_serializes_across_processes(tmp_path):
     """Two processes building the same tag take turns instead of racing."""
     import subprocess
     import sys
-    code = ("import sys, time\nfrom vals_harness.sandbox.docker import build_lock\n"
-            "with build_lock('vals/test-lock:x'):\n"
+    code = ("import sys, time\nfrom valve.sandbox.docker import build_lock\n"
+            "with build_lock('valve/test-lock:x'):\n"
             "    open(sys.argv[1], 'a').write('in\\n'); time.sleep(0.5); open(sys.argv[1], 'a').write('out\\n')\n")
     log = tmp_path / "log"
     procs = [subprocess.Popen([sys.executable, "-c", code, str(log)]) for _ in range(2)]

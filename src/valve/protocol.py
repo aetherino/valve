@@ -1,4 +1,4 @@
-"""vals-agent/1: newline-delimited JSON-RPC 2.0 between the worker and an agent (DESIGN.md §5.2).
+"""valve-agent/1: newline-delimited JSON-RPC 2.0 between the worker and an agent (DESIGN.md §5.2).
 
 Transport is an interface: stdio pipes today (local process or `docker run -i`),
 a WebSocket for remote agents later. Messages never contain transport details.
@@ -11,7 +11,7 @@ import queue
 import threading
 from typing import IO, Any, Protocol
 
-PROTOCOL = "vals-agent/1"
+PROTOCOL = "valve-agent/1"
 
 # JSON-RPC error codes
 METHOD_NOT_FOUND = -32601
@@ -27,7 +27,7 @@ class TransportClosed(Exception):
 
 
 class ProtocolError(Exception):
-    """A message that isn't valid vals-agent/1."""
+    """A message that isn't valid valve-agent/1."""
 
 
 class Transport(Protocol):

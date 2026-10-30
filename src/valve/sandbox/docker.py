@@ -15,8 +15,8 @@ import threading
 import time
 from pathlib import Path
 
-from vals_harness.errors import ChamberStopped, InfraError
-from vals_harness.sandbox import ExecResult
+from valve.errors import ChamberStopped, InfraError
+from valve.sandbox import ExecResult
 
 MAX_OUTPUT_BYTES = 1_000_000        # per exec, returned to the agent
 MAX_FILE_BYTES = 10_000_000         # per `get`
@@ -305,7 +305,7 @@ class DockerSandbox:
 @contextlib.contextmanager
 def build_lock(tag: str):
     """Exclusive lock per image tag across processes on this machine (flock)."""
-    lock_dir = Path(tempfile.gettempdir()) / "vals-build-locks"
+    lock_dir = Path(tempfile.gettempdir()) / "valve-build-locks"
     lock_dir.mkdir(exist_ok=True)
     with open(lock_dir / (hashlib.sha256(tag.encode()).hexdigest()[:16] + ".lock"), "w") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
@@ -336,7 +336,7 @@ class DockerSandboxProvider:
         for f in sorted(p for p in context.rglob("*") if p.is_file()):
             h.update(str(f.relative_to(context)).encode())
             h.update(f.read_bytes())
-        return f"vals/{name or context.name + '-tooling'}:{h.hexdigest()[:12]}"
+        return f"valve/{name or context.name + '-tooling'}:{h.hexdigest()[:12]}"
 
     def _build(self, dockerfile: Path, name: str | None = None) -> str:
         """Build once per content hash of the build context. Concurrent trials needing the
@@ -355,7 +355,7 @@ class DockerSandboxProvider:
     def create(self, image: str, *, labels: dict[str, str], network: str = "none",
                cpus: float = 1.0, memory: str = "1g", volumes: dict[str, str] | None = None,
                workdir: str = "/workspace") -> DockerSandbox:
-        args = ["run", "-d", "--label", "vals.managed=1"]
+        args = ["run", "-d", "--label", "valve.managed=1"]
         for k, v in labels.items():
             args += ["--label", f"{k}={v}"]
         for vol, path in (volumes or {}).items():   # phantom placement: /workspace + /tmp shared with the box
@@ -378,7 +378,7 @@ class DockerSandboxProvider:
     def reap(self, labels: dict[str, str]) -> int:
         """Remove sandboxes matching all labels. Never raises: cleanup must not crash a worker."""
         try:
-            args = ["ps", "-aq", "--filter", "label=vals.managed=1"]
+            args = ["ps", "-aq", "--filter", "label=valve.managed=1"]
             for k, v in labels.items():
                 args += ["--filter", f"label={k}={v}"]
             ids = _docker(args, check=False, timeout=60).stdout.decode().split()
@@ -390,11 +390,11 @@ class DockerSandboxProvider:
 
     def reap_stale(self, live_claims: set[str], home: str) -> int:
         """Remove this home's harness sandboxes whose claim is no longer live (dead workers'
-        leftovers). Filtering by `vals.home` keeps a worker (or a test) with another
-        VALS_HOME from deleting live containers it knows nothing about."""
+        leftovers). Filtering by `valve.home` keeps a worker (or a test) with another
+        VALVE_HOME from deleting live containers it knows nothing about."""
         try:
-            out = _docker(["ps", "-a", "--filter", "label=vals.managed=1", "--filter", f"label=vals.home={home}",
-                           "--format", '{{.ID}} {{.Label "vals.claim"}}'], check=False, timeout=60).stdout.decode()
+            out = _docker(["ps", "-a", "--filter", "label=valve.managed=1", "--filter", f"label=valve.home={home}",
+                           "--format", '{{.ID}} {{.Label "valve.claim"}}'], check=False, timeout=60).stdout.decode()
             stale = [cid for cid, _, claim in (line.partition(" ") for line in out.splitlines())
                      if claim not in live_claims]
             if stale:
@@ -404,9 +404,9 @@ class DockerSandboxProvider:
             return 0
 
 
-def vals_images() -> list[str]:
-    """Every locally built harness image (repository vals/*), as repo:tag."""
-    out = _docker(["images", "--format", "{{.Repository}}:{{.Tag}}", "--filter", "reference=vals/*"],
+def valve_images() -> list[str]:
+    """Every locally built harness image (repository valve/*), as repo:tag."""
+    out = _docker(["images", "--format", "{{.Repository}}:{{.Tag}}", "--filter", "reference=valve/*"],
                   check=False, timeout=60).stdout.decode()
     return [line for line in out.split() if line and not line.endswith(":<none>")]
 

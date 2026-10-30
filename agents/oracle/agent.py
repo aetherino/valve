@@ -1,7 +1,7 @@
 """oracle: replays a known-good shell script per task. Expect 100% — proves the pipeline end to end."""
 from pathlib import Path
 
-from vals_agent_sdk.client import AgentClient
+from valve_agent_sdk.client import AgentClient
 
 client = AgentClient("oracle", "1")
 script = Path(__file__).parent / "solutions" / f"{client.task.get('id')}.sh"

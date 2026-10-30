@@ -1,5 +1,5 @@
 [project]
-name = "vals-harness"
+name = "valve"
 version = "0.1.0"
 description = "Run any agent against any benchmark"
 readme = "README.md"
@@ -19,14 +19,14 @@ mini = ["mini-swe-agent>=2.4", "mcp"]
 dev = ["pytest>=8.0"]
 
 [project.scripts]
-harness = "vals_harness.cli:main"
+harness = "valve.cli:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/vals_harness", "src/vals_agent_sdk"]
+packages = ["src/valve", "src/valve_agent_sdk"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

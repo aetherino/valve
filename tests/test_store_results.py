@@ -1,8 +1,8 @@
 import pytest
 
-from vals_harness.results import summarize
-from vals_harness.specs import Policy, RunSpec, resolve_trials
-from vals_harness.store import LostLease, Store
+from valve.results import summarize
+from valve.specs import Policy, RunSpec, resolve_trials
+from valve.store import LostLease, Store
 
 
 @pytest.fixture

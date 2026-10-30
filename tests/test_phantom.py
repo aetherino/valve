@@ -7,10 +7,10 @@ import textwrap
 
 import pytest
 
-from vals_harness import service
-from vals_harness.results import summarize
-from vals_harness.specs import RunSpec
-from vals_harness.store import Store
+from valve import service
+from valve.results import summarize
+from valve.specs import RunSpec
+from valve.store import Store
 
 pytestmark = pytest.mark.docker
 
@@ -18,11 +18,11 @@ FAKE_CLI = r"""#!/usr/lib/phantom/bash.real
 # Pretends to be an agent CLI: every `sh -c` below goes through the phantom shell.
 cat > /dev/null   # the instruction
 sh -c "printf 'def add():\n    return 4\n' > solution.py"
-in_chamber_secret=$(sh -c 'env' | grep -c '^VALS_TEST_SECRET=')
+in_chamber_secret=$(sh -c 'env' | grep -c '^VALVE_TEST_SECRET=')
 chamber_net=$(sh -c "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://example.com\", timeout=3)' >/dev/null 2>&1 && echo online || echo offline")
 rc=$(sh -c 'exit 7'; echo $?)
 printf '{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":0,"result":"box_secret=%s chamber_secret=%s chamber_net=%s rc=%s"}\n' \
-  "${VALS_TEST_SECRET:-none}" "$in_chamber_secret" "$chamber_net" "$rc"
+  "${VALVE_TEST_SECRET:-none}" "$in_chamber_secret" "$chamber_net" "$rc"
 """
 
 
@@ -36,10 +36,10 @@ def test_phantom_box_relays_its_shell_into_the_chamber(root, tmp_path, monkeypat
         name: fake-phantom
         placement: phantom
         installed: {run: fakecli, output_parser: claude_stream_json}
-        secrets: [VALS_TEST_SECRET]
+        secrets: [VALVE_TEST_SECRET]
         """))
-    monkeypatch.setenv("VALS_HOME", str(tmp_path / "home"))
-    monkeypatch.setenv("VALS_TEST_SECRET", "s3cret")
+    monkeypatch.setenv("VALVE_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("VALVE_TEST_SECRET", "s3cret")
     paths = service.Paths.from_root(root)
     run_id = service.submit(paths, RunSpec(agent=str(folder), benchmark="python-tasks", task_ids=["py-001"]))
     service.work(paths, run_id=run_id)
@@ -78,7 +78,7 @@ def test_env_check_flags_declared_expectations_the_chamber_lacks(root, tmp_path,
         # alpine has no bash for the fake CLI's shebang inside the box either: give the box one
         (folder / "install.Dockerfile").write_text("ARG BASE\nFROM ${BASE}\nRUN apk add --no-cache bash\n"
                                                    "COPY fakecli /usr/local/bin/fakecli\nRUN chmod +x /usr/local/bin/fakecli\n")
-    monkeypatch.setenv("VALS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("VALVE_HOME", str(tmp_path / "home"))
     paths = service.Paths.from_root(root)
     run_id = service.submit(paths, RunSpec(agent=str(folder), benchmark=benchmark, task_ids=[task]))
     service.work(paths, run_id=run_id)
@@ -115,7 +115,7 @@ def test_phantom_workspace_stays_in_step_with_the_chamber(root, tmp_path, monkey
                                                "RUN chmod +x /usr/local/bin/fakecli\n")
     (folder / "agent.yaml").write_text(f"name: fake-sync-{link}\nplacement: phantom\nlink: {link}\n"
                                        "installed: {run: fakecli, output_parser: claude_stream_json}\n")
-    monkeypatch.setenv("VALS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("VALVE_HOME", str(tmp_path / "home"))
     paths = service.Paths.from_root(root)
     run_id = service.submit(paths, RunSpec(agent=str(folder), benchmark="python-tasks", task_ids=["py-001"]))
     service.work(paths, run_id=run_id)

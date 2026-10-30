@@ -1,4 +1,4 @@
-"""Agent side of vals-agent/1. Stdlib only, so any agent image can vendor it.
+"""Agent side of valve-agent/1. Stdlib only, so any agent image can vendor it.
 
 Usage:
     client = AgentClient("my-agent", "1.0")      # handshake + waits for the task
@@ -18,7 +18,7 @@ import os
 import sys
 from typing import Any
 
-PROTOCOL = "vals-agent/1"
+PROTOCOL = "valve-agent/1"
 
 
 class ChamberError(Exception):

@@ -1,6 +1,6 @@
 """Entry point for one trial in its own process (spawned by the worker supervisor).
 
-    python -m vals_harness.trial_child <job.json> <result.json>
+    python -m valve.trial_child <job.json> <result.json>
 
 The child runs the trial and writes the result file; the supervisor is the only
 one that records final results in the DB, renews leases, and kills the child if
@@ -22,10 +22,10 @@ import threading
 import time
 from pathlib import Path
 
-from vals_harness.sandbox.docker import DockerSandboxProvider
-from vals_harness.specs import TrialSpec
-from vals_harness.store import Claim, LostLease, Store
-from vals_harness.trial import TrialRunner
+from valve.sandbox.docker import DockerSandboxProvider
+from valve.specs import TrialSpec
+from valve.store import Claim, LostLease, Store
+from valve.trial import TrialRunner
 
 PARENT_POLL_S = 1.0
 
@@ -33,7 +33,7 @@ PARENT_POLL_S = 1.0
 def _watch_parent(parent: int, claim: Claim, db: Path, provider: DockerSandboxProvider, job: Path) -> None:
     while os.getppid() == parent:
         time.sleep(PARENT_POLL_S)
-    provider.reap({"vals.claim": claim.token})
+    provider.reap({"valve.claim": claim.token})
     try:
         Store(db).release(claim.spec.trial_id, claim.token)   # fenced: a no-op if someone took over
     except Exception:
@@ -41,7 +41,7 @@ def _watch_parent(parent: int, claim: Claim, db: Path, provider: DockerSandboxPr
     job.unlink(missing_ok=True)
     # Again: the trial thread may have started a container meanwhile. Anything created
     # after this is left to the next worker's reap_stale (its claim is no longer live).
-    provider.reap({"vals.claim": claim.token})
+    provider.reap({"valve.claim": claim.token})
     os._exit(3)
 
 

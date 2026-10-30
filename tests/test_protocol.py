@@ -6,11 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from vals_harness.chamber_api import ChamberApi
-from vals_harness.errors import ChamberStopped, InfraError
-from vals_harness.launchers import HostLauncher
-from vals_harness.sandbox import ExecResult
-from vals_harness.specs import AgentSpec
+from valve.chamber_api import ChamberApi
+from valve.errors import ChamberStopped, InfraError
+from valve.launchers import HostLauncher
+from valve.sandbox import ExecResult
+from valve.specs import AgentSpec
 
 
 class FakeSandbox:
@@ -57,7 +57,7 @@ class ListRecorder:
 def _serve(tmp_path: Path, body: str, timeout_s: float = 20, output_bytes: int = 0):
     folder = tmp_path / "agent"
     folder.mkdir(parents=True)
-    (folder / "agent.py").write_text("from vals_agent_sdk.client import AgentClient\n" + textwrap.dedent(body))
+    (folder / "agent.py").write_text("from valve_agent_sdk.client import AgentClient\n" + textwrap.dedent(body))
     spec = AgentSpec(name="t", placement="host", command=["python", "agent.py"], root=folder)
     sb, rec = FakeSandbox(output_bytes), ListRecorder()
     session = HostLauncher().launch(spec, tmp_path / "stderr.log", {})
@@ -108,7 +108,7 @@ def test_deadline_cancels_then_kills(tmp_path):
 
 def test_missing_file_is_a_clean_error(tmp_path):
     outcome, _, _ = _serve(tmp_path, """
-        from vals_agent_sdk.client import ChamberError
+        from valve_agent_sdk.client import ChamberError
         c = AgentClient("t", "1")
         try:
             c.get("nope.txt")
@@ -120,7 +120,7 @@ def test_missing_file_is_a_clean_error(tmp_path):
 
 def test_malformed_params_get_errors_and_never_crash_the_session(tmp_path):
     outcome, sb, _ = _serve(tmp_path, """
-        from vals_agent_sdk.client import ChamberError
+        from valve_agent_sdk.client import ChamberError
         c = AgentClient("t", "1")
         codes = []
         for method, params in [("exec", {"cmd": 42}), ("exec", {"cmd": "x", "env": ["a"]}),
@@ -148,7 +148,7 @@ def test_finish_with_garbage_numbers_is_parsed_leniently(tmp_path):
 
 def test_agent_that_stops_reading_cannot_block_the_worker(tmp_path, monkeypatch):
     """Big replies fill the pipe; the worker's send blocks; the watchdog must still end it."""
-    import vals_harness.chamber_api as ca
+    import valve.chamber_api as ca
     monkeypatch.setattr(ca, "CANCEL_GRACE_S", 1)
     monkeypatch.setattr(ca, "WATCHDOG_SLACK_S", 1)
     t0 = time.monotonic()
@@ -166,7 +166,7 @@ def test_agent_that_stops_reading_cannot_block_the_worker(tmp_path, monkeypatch)
 def test_agent_stopping_its_chamber_ends_the_session_as_agent_error(tmp_path):
     t0 = time.monotonic()
     outcome, sb, rec = _serve(tmp_path, """
-        from vals_agent_sdk.client import ChamberError
+        from valve_agent_sdk.client import ChamberError
         c = AgentClient("t", "1")
         codes = []
         for cmd in ("kill 1", "echo after"):

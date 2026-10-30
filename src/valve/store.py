@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from vals_harness.specs import RunSpec, TrialSpec
+from valve.specs import RunSpec, TrialSpec
 
 ACTIVE = ("preparing", "running_agent", "verifying")
 TERMINAL = ("graded", "infra_error", "cancelled")
@@ -89,8 +89,8 @@ class Store:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path.resolve()
-        # Every container of this home is labeled vals.home=<home_id>, so reapers of other
-        # homes (another VALS_HOME, a test run) never touch it.
+        # Every container of this home is labeled valve.home=<home_id>, so reapers of other
+        # homes (another VALVE_HOME, a test run) never touch it.
         self.home_id = hashlib.sha256(str(self.path).encode()).hexdigest()[:12]
         # isolation_level=None: autocommit; we open explicit transactions where it matters.
         self.db = sqlite3.connect(path, timeout=30, isolation_level=None, check_same_thread=False)

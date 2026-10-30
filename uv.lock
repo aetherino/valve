@@ -3011,7 +3011,7 @@ wheels = [
 ]
 
 [[package]]
-name = "vals-harness"
+name = "valve"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

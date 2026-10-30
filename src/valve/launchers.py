@@ -20,19 +20,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from vals_harness.errors import InfraError
-from vals_harness.protocol import StdioTransport, Transport
-from vals_harness.sandbox.docker import build_lock, HARDENING, _docker
-from vals_harness.specs import AgentSpec
+from valve.errors import InfraError
+from valve.protocol import StdioTransport, Transport
+from valve.sandbox.docker import build_lock, HARDENING, _docker
+from valve.specs import AgentSpec
 
-SRC_DIR = Path(__file__).resolve().parents[1]  # .../src, so agents can import vals_agent_sdk
-SDK_DIR = SRC_DIR / "vals_agent_sdk"
+SRC_DIR = Path(__file__).resolve().parents[1]  # .../src, so agents can import valve_agent_sdk
+SDK_DIR = SRC_DIR / "valve_agent_sdk"
 
 # Used for agents whose folder has no Dockerfile: Python + the SDK + the agent folder.
 DEFAULT_AGENT_DOCKERFILE = """\
 FROM python:3.11-slim
-COPY vals_agent_sdk /opt/vals/vals_agent_sdk
-ENV PYTHONPATH=/opt/vals PYTHONUNBUFFERED=1
+COPY valve_agent_sdk /opt/valve/valve_agent_sdk
+ENV PYTHONPATH=/opt/valve PYTHONUNBUFFERED=1
 WORKDIR /agent
 COPY agent/ /agent/
 """
@@ -141,7 +141,7 @@ class DockerLauncher:
         for base in (agent.root, SDK_DIR):
             for f in sorted(p for p in base.rglob("*") if p.is_file() and "__pycache__" not in p.parts):
                 h.update(str(f.relative_to(base)).encode() + b"\0" + f.read_bytes())
-        return f"vals/agent-{agent.name}:{h.hexdigest()[:12]}"
+        return f"valve/agent-{agent.name}:{h.hexdigest()[:12]}"
 
     def image_for(self, agent: AgentSpec) -> str:
         """Build the agent image once per content hash."""
@@ -151,11 +151,11 @@ class DockerLauncher:
         tag = self.tag_for(agent)
         with build_lock(tag):   # concurrent trials wait instead of racing the same build
             if _docker(["image", "inspect", tag], check=False).returncode != 0:
-                with tempfile.TemporaryDirectory(prefix="vals-agent-build-") as ctx:
+                with tempfile.TemporaryDirectory(prefix="valve-agent-build-") as ctx:
                     # Build context = the agent folder + the SDK, nothing else from the repo.
                     shutil.copytree(agent.root, Path(ctx) / "agent",
                                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".env*"))
-                    shutil.copytree(SDK_DIR, Path(ctx) / "vals_agent_sdk", ignore=shutil.ignore_patterns("__pycache__"))
+                    shutil.copytree(SDK_DIR, Path(ctx) / "valve_agent_sdk", ignore=shutil.ignore_patterns("__pycache__"))
                     (Path(ctx) / "Dockerfile").write_bytes(recipe)
                     _docker(["build", "-q", "-t", tag, ctx], timeout=AGENT_BUILD_TIMEOUT_S, kind="image")
         self._images[agent.name] = tag
@@ -169,11 +169,11 @@ class DockerLauncher:
 
     def launch(self, agent: AgentSpec, stderr_path: Path, labels: dict[str, str]) -> AgentSession:
         # The pinned id from prepare(), never the tag: a tag can move, and a missing one
-        # would make `docker run` pull `vals/agent-...` from a registry (`--pull never`).
+        # would make `docker run` pull `valve/agent-...` from a registry (`--pull never`).
         image = self._ids.get(agent.name) or self.prepare(agent)
-        name = f"vals-agent-{labels.get('vals.claim', os.urandom(6).hex())[:12]}"
-        argv = ["docker", "run", "-i", "--rm", "--pull", "never", "--name", name, "--label", "vals.managed=1",
-                "--label", "vals.role=agent"]
+        name = f"valve-agent-{labels.get('valve.claim', os.urandom(6).hex())[:12]}"
+        argv = ["docker", "run", "-i", "--rm", "--pull", "never", "--name", name, "--label", "valve.managed=1",
+                "--label", "valve.role=agent"]
         for k, v in labels.items():
             argv += ["--label", f"{k}={v}"]
         argv += [*HARDENING, "--cpus", AGENT_CPUS, "--memory", AGENT_MEMORY, "--network", "bridge"]

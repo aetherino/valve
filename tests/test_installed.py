@@ -6,11 +6,11 @@ import textwrap
 
 import pytest
 
-from vals_harness import service
-from vals_harness.installed import _secret_env, parse_claude_stream_json
-from vals_harness.results import summarize
-from vals_harness.specs import AgentSpec, InstalledRuntime, RunSpec
-from vals_harness.store import Store
+from valve import service
+from valve.installed import _secret_env, parse_claude_stream_json
+from valve.results import summarize
+from valve.specs import AgentSpec, InstalledRuntime, RunSpec
+from valve.store import Store
 
 
 class _Rec:
@@ -146,7 +146,7 @@ instruction=$(cat)
 printf 'Hello World' > hello.txt
 echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"printf Hello World > hello.txt"}}]}}'
 printf '{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":0,"result":"secret=%s net=%s"}\n' \
-  "$VALS_TEST_SECRET" "$(ls /workspace | tr '\n' ',')"
+  "$VALVE_TEST_SECRET" "$(ls /workspace | tr '\n' ',')"
 """
 
 
@@ -161,10 +161,10 @@ def test_installed_agent_end_to_end(root, tmp_path, monkeypatch):
         name: fake-cli
         placement: installed
         installed: {run: fakecli, output_parser: claude_stream_json}
-        secrets: [VALS_TEST_SECRET]
+        secrets: [VALVE_TEST_SECRET]
         """))
-    monkeypatch.setenv("VALS_HOME", str(tmp_path / "home"))
-    monkeypatch.setenv("VALS_TEST_SECRET", "s3cret")
+    monkeypatch.setenv("VALVE_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("VALVE_TEST_SECRET", "s3cret")
     paths = service.Paths.from_root(root)
     run_id = service.submit(paths, RunSpec(agent=str(folder), benchmark="bash-operations", task_ids=["bash-001"]))
     service.work(paths, run_id=run_id)
@@ -202,7 +202,7 @@ def _fake_installed_agent(tmp_path, name, script, secrets="[]"):
 @pytest.mark.docker
 def test_installed_agent_that_stops_its_chamber_is_graded(root, tmp_path, monkeypatch):
     folder = _fake_installed_agent(tmp_path, "fake-killer-cli", KILLER_CLI)
-    monkeypatch.setenv("VALS_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("VALVE_HOME", str(tmp_path / "home"))
     paths = service.Paths.from_root(root)
     run_id = service.submit(paths, RunSpec(agent=str(folder), benchmark="bash-operations", task_ids=["bash-001"]))
     service.work(paths, run_id=run_id)
@@ -216,25 +216,25 @@ def test_installed_agent_that_stops_its_chamber_is_graded(root, tmp_path, monkey
 
 
 def test_submit_refuses_a_run_whose_agent_secret_is_missing(root, tmp_path, monkeypatch):
-    folder = _fake_installed_agent(tmp_path, "needs-key", "#!/bin/sh\n", secrets="[VALS_TEST_MISSING_KEY]")
-    monkeypatch.delenv("VALS_TEST_MISSING_KEY", raising=False)
-    monkeypatch.setenv("VALS_HOME", str(tmp_path / "home"))
+    folder = _fake_installed_agent(tmp_path, "needs-key", "#!/bin/sh\n", secrets="[VALVE_TEST_MISSING_KEY]")
+    monkeypatch.delenv("VALVE_TEST_MISSING_KEY", raising=False)
+    monkeypatch.setenv("VALVE_HOME", str(tmp_path / "home"))
     paths = service.Paths.from_root(root)
-    with pytest.raises(ValueError, match="VALS_TEST_MISSING_KEY"):
+    with pytest.raises(ValueError, match="VALVE_TEST_MISSING_KEY"):
         service.submit(paths, RunSpec(agent=str(folder), benchmark="bash-operations", task_ids=["bash-001"]))
     assert Store(paths.db).runs() == []
 
 
 def test_prepare_fails_fast_when_the_worker_lacks_the_secret(root, tmp_path, monkeypatch):
     """Submitted with the key, run by a worker without it: infra_error (config), retried, never graded."""
-    from vals_harness.specs import Policy
-    folder = _fake_installed_agent(tmp_path, "needs-key", "#!/bin/sh\n", secrets="[VALS_TEST_MISSING_KEY]")
-    monkeypatch.setenv("VALS_TEST_MISSING_KEY", "k")
-    monkeypatch.setenv("VALS_HOME", str(tmp_path / "home"))
+    from valve.specs import Policy
+    folder = _fake_installed_agent(tmp_path, "needs-key", "#!/bin/sh\n", secrets="[VALVE_TEST_MISSING_KEY]")
+    monkeypatch.setenv("VALVE_TEST_MISSING_KEY", "k")
+    monkeypatch.setenv("VALVE_HOME", str(tmp_path / "home"))
     paths = service.Paths.from_root(root)
     run_id = service.submit(paths, RunSpec(agent=str(folder), benchmark="bash-operations", task_ids=["bash-001"],
                                            policy=Policy(infra_retries=0)))
-    monkeypatch.delenv("VALS_TEST_MISSING_KEY")
+    monkeypatch.delenv("VALVE_TEST_MISSING_KEY")
     service.work(paths, run_id=run_id)
     (t,) = summarize(Store(paths.db), run_id)["trials"]
     assert t["status"] == "infra_error" and t["error"]["kind"] == "config", t

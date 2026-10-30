@@ -28,13 +28,13 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from vals_harness.errors import InfraError
-from vals_harness.installed import InstalledRunner, _public_env, _secret_env
-from vals_harness.launchers import ProcessSession, _start
-from vals_harness.netlink import TrialListener
-from vals_harness.protocol import StdioTransport
-from vals_harness.sandbox.docker import build_lock, HARDENING, _docker
-from vals_harness.specs import AgentSpec
+from valve.errors import InfraError
+from valve.installed import InstalledRunner, _public_env, _secret_env
+from valve.launchers import ProcessSession, _start
+from valve.netlink import TrialListener
+from valve.protocol import StdioTransport
+from valve.sandbox.docker import build_lock, HARDENING, _docker
+from valve.specs import AgentSpec
 
 CRATE_DIR = Path(__file__).resolve().parents[2] / "phantom"
 RUST_IMAGE = "rust:1.93-alpine"
@@ -64,7 +64,7 @@ RUN set -e; mkdir -p /usr/lib/phantom /var/lib/phantom /run/phantom; \\
 
 def volume_names(claim_token: str, workspace: str = "/workspace") -> dict[str, str]:
     t = claim_token[:16]
-    return {f"vals-ws-{t}": workspace, f"vals-tmp-{t}": "/tmp"}
+    return {f"valve-ws-{t}": workspace, f"valve-tmp-{t}": "/tmp"}
 
 
 def create_volumes(claim_token: str, labels: dict[str, str], workspace: str = "/workspace") -> dict[str, str]:
@@ -72,7 +72,7 @@ def create_volumes(claim_token: str, labels: dict[str, str], workspace: str = "/
     a task image's own workspace contents (assets) show up in both containers."""
     vols = volume_names(claim_token, workspace)
     for name in vols:
-        args = ["volume", "create", "--label", "vals.managed=1"]
+        args = ["volume", "create", "--label", "valve.managed=1"]
         for k, v in labels.items():
             args += ["--label", f"{k}={v}"]
         _docker([*args, name])
@@ -98,9 +98,9 @@ class PhantomLauncher:
         tag = self.tag_for(agent, base_id)
         with build_lock(tag):   # concurrent trials wait instead of racing the same build
             if _docker(["image", "inspect", tag], check=False).returncode != 0:
-                base_tag = f"vals/base:{base_id.removeprefix('sha256:')[:16]}"
+                base_tag = f"valve/base:{base_id.removeprefix('sha256:')[:16]}"
                 _docker(["tag", base_id, base_tag])
-                with tempfile.TemporaryDirectory(prefix="vals-phantom-build-") as ctx:
+                with tempfile.TemporaryDirectory(prefix="valve-phantom-build-") as ctx:
                     shutil.copytree(CRATE_DIR, Path(ctx) / "phantom", ignore=shutil.ignore_patterns("target"))
                     (Path(ctx) / "Dockerfile").write_text(PHANTOM_LAYER)
                     _docker(["build", "-q", "--build-arg", f"BASE={base_tag}", "-t", tag, ctx],
@@ -115,7 +115,7 @@ class PhantomLauncher:
         h = hashlib.sha256(PHANTOM_LAYER.encode() + base_id.encode())
         for f in sorted(p for p in CRATE_DIR.rglob("*") if p.is_file() and "target" not in p.parts):
             h.update(str(f.relative_to(CRATE_DIR)).encode() + b"\0" + f.read_bytes())
-        return f"vals/phantom-{agent.name}:{h.hexdigest()[:12]}"
+        return f"valve/phantom-{agent.name}:{h.hexdigest()[:12]}"
 
     def launch(self, agent: AgentSpec, image_id: str, stderr_path: Path, labels: dict[str, str],
                volumes: dict[str, str], workspace: str = "/workspace") -> ProcessSession:
@@ -126,9 +126,9 @@ class PhantomLauncher:
         if rt is None:
             raise InfraError("adapter", f"agent {agent.name} has no installed runtime")
         network_link = agent.link == "network"
-        name = f"vals-phantom-{labels.get('vals.claim', os.urandom(6).hex())[:12]}"
+        name = f"valve-phantom-{labels.get('valve.claim', os.urandom(6).hex())[:12]}"
         argv = ["docker", "run", "--rm", "--pull", "never", "--name", name,
-                "--label", "vals.managed=1", "--label", "vals.role=phantom"]
+                "--label", "valve.managed=1", "--label", "valve.role=phantom"]
         if not network_link:
             argv.insert(2, "-i")
         for k, v in labels.items():

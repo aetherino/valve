@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from vals_harness.specs import RunSpec, load_agent, load_benchmark, load_tasks, resolve_trials
+from valve.specs import RunSpec, load_agent, load_benchmark, load_tasks, resolve_trials
 
 
 def test_benchmarks_normalize_their_own_field_names(root):
@@ -52,7 +52,7 @@ def test_manifest_hash_is_stable_and_sensitive(root):
 
 
 def test_expects_must_be_program_names(tmp_path):
-    from vals_harness.specs import AgentSpec
+    from valve.specs import AgentSpec
     AgentSpec(name="a", placement="sidecar", command=["x"], expects=["bash", "python3"], root=tmp_path)
     with pytest.raises(ValidationError):
         AgentSpec(name="a", placement="sidecar", command=["x"], expects=["bash; rm -rf /"], root=tmp_path)

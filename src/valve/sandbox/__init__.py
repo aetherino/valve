@@ -66,6 +66,6 @@ class SandboxProvider(Protocol):
         ...
 
     def reap_stale(self, live_claims: set[str], home: str) -> int:
-        """Remove sandboxes of this harness home (`vals.home` label) whose claim isn't
+        """Remove sandboxes of this harness home (`valve.home` label) whose claim isn't
         live any more (a dead worker's leftovers). Other homes' sandboxes are never touched."""
         ...

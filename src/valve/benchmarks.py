@@ -33,9 +33,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from vals_harness.errors import ChamberStopped, InfraError
-from vals_harness.sandbox import ExecResult, Sandbox, SandboxProvider
-from vals_harness.specs import BenchmarkSpec, Task, VerifyMode
+from valve.errors import ChamberStopped, InfraError
+from valve.sandbox import ExecResult, Sandbox, SandboxProvider
+from valve.specs import BenchmarkSpec, Task, VerifyMode
 
 BENCH_DIR = "/bench"        # benchmark folder inside tooling/verifier sandboxes
 OUT_DIR = "/out"            # where prepare scripts write the initial workspace
@@ -149,7 +149,7 @@ def make_benchmark(spec: BenchmarkSpec, provider: SandboxProvider | None) -> Ben
     path = spec.root / file
     if not path.is_file() or not cls_name:
         raise InfraError("adapter", f"benchmark {spec.name}: adapter must be 'file.py:Class' in its folder")
-    mod_spec = importlib.util.spec_from_file_location(f"vals_bench_{spec.name.replace('-', '_')}", path)
+    mod_spec = importlib.util.spec_from_file_location(f"valve_bench_{spec.name.replace('-', '_')}", path)
     assert mod_spec and mod_spec.loader
     module = importlib.util.module_from_spec(mod_spec)
     mod_spec.loader.exec_module(module)
@@ -175,7 +175,7 @@ class ScriptBenchmark:
         return self._tooling_image
 
     def tasks(self) -> list[Task]:
-        from vals_harness.specs import load_tasks
+        from valve.specs import load_tasks
         return load_tasks(self.spec)
 
     def images(self, task: Task) -> dict[str, str]:
@@ -200,7 +200,7 @@ class ScriptBenchmark:
                 shutil.rmtree(d)
         evaldir.mkdir(parents=True)
 
-        with self.provider.create(self.tooling_image(), labels={**labels, "vals.role": "tooling"}) as sb:
+        with self.provider.create(self.tooling_image(), labels={**labels, "valve.role": "tooling"}) as sb:
             sb.put_dir(self.spec.root, BENCH_DIR)
             try:
                 r = sb.exec(self._argv(self.spec.prepare, task, out=OUT_DIR),
@@ -231,7 +231,7 @@ class ScriptBenchmark:
         otherwise an agent could drop its own failures out of the accuracy number.
         """
         graded_ws, skipped = self.build_graded_workspace(snapshot_tar, prepared, workdir, task.workspace)
-        with self.provider.create(self.tooling_image(), labels={**labels, "vals.role": "verifier"},
+        with self.provider.create(self.tooling_image(), labels={**labels, "valve.role": "verifier"},
                                   network=self.spec.verify_network) as sb:
             sb.put_dir(self.spec.root, BENCH_DIR)
             sb.put_dir(graded_ws, task.workspace)
@@ -431,7 +431,7 @@ class TaskDirBenchmark:
         replaced by the agent's submission, then the tests."""
         graded_ws, skipped = build_graded_workspace(snapshot_tar, prepared, workdir, task.workspace,
                                                     self.spec.submission_paths)
-        with self.provider.create(images["task_image"], labels={**labels, "vals.role": "verifier"},
+        with self.provider.create(images["task_image"], labels={**labels, "valve.role": "verifier"},
                                   network=self.spec.verify_network, workdir=task.workspace) as sb:
             if "**" in self.spec.submission_paths:   # mirror deletions too, not just new files
                 sb.exec(f"find {shlex.quote(task.workspace)} -mindepth 1 -delete", timeout=60, cwd="/")

@@ -2,7 +2,7 @@
 
 Every one of these used to surface as an infra_error (retried, then excluded from accuracy).
 """
-from vals_agent_sdk.client import AgentClient, ChamberError
+from valve_agent_sdk.client import AgentClient, ChamberError
 
 client = AgentClient("vandal", "1")
 bad_requests = [

@@ -3,7 +3,7 @@
 //! One static binary, two roles, picked by how it is invoked:
 //!
 //! * `phantom run --output <file> [--connect HOST:PORT --token T --sync] -- <agent cmd...>`:
-//!   the **runner**, the box's main process. It speaks vals-agent/1 (newline-delimited
+//!   the **runner**, the box's main process. It speaks valve-agent/1 (newline-delimited
 //!   JSON-RPC) with the worker's Chamber API, over stdin/stdout or, with `--connect`,
 //!   over TCP (so the box can run anywhere that reaches the worker). It starts the agent
 //!   CLI with the instruction on its stdin and serves a unix socket inside the box for
@@ -36,8 +36,8 @@ use std::time::Duration;
 
 const SOCKET: &str = "/run/phantom/phantom.sock";
 const REAL_BASH: &str = "/usr/lib/phantom/bash.real";
-const PROTOCOL: &str = "vals-agent/1";
-const CWD_MARKER: &str = "__VALS_CWD__";
+const PROTOCOL: &str = "valve-agent/1";
+const CWD_MARKER: &str = "__VALVE_CWD__";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -137,7 +137,7 @@ fn forwardable(cmd: &str) -> (String, Option<String>) {
     if let Some(j) = body.rfind(" && pwd -P >| ") {
         let file = body[j + " && pwd -P >| ".len()..].trim().to_string();
         let core = &body[..j];
-        let fwd = format!("{core}; __vals_rc=$?; [ $__vals_rc -eq 0 ] && printf '\\n{CWD_MARKER}%s\\n' \"$(pwd -P)\"; exit $__vals_rc");
+        let fwd = format!("{core}; __valve_rc=$?; [ $__valve_rc -eq 0 ] && printf '\\n{CWD_MARKER}%s\\n' \"$(pwd -P)\"; exit $__valve_rc");
         return (fwd, Some(file));
     }
     (body.to_string(), None)
@@ -216,7 +216,7 @@ fn connect(addr: Option<&str>, token: &str) -> std::io::Result<(Box<dyn BufRead 
 }
 
 fn run(args: &[String]) -> i32 {
-    let mut output = String::from("/tmp/vals/agent/output.jsonl");
+    let mut output = String::from("/tmp/valve/agent/output.jsonl");
     let (mut addr, mut token, mut sync_on) = (None::<String>, String::new(), false);
     let mut i = 0;
     while i < args.len() && args[i] != "--" {
@@ -417,11 +417,11 @@ mod tests {
     fn strips_claude_wrapper_and_reports_cwd_through_output() {
         let c = "source /tmp/cc/snap.sh 2>/dev/null || true && shopt -u extglob 2>/dev/null || true && { \\builtin unalias -- 'x'; } >/dev/null 2>&1 || true && eval 'echo hi' < /dev/null && pwd -P >| /tmp/claude-1-cwd";
         let (fwd, file) = forwardable(c);
-        assert!(fwd.starts_with("eval 'echo hi' < /dev/null; __vals_rc=$?;"), "{fwd}");
-        assert!(fwd.contains(CWD_MARKER) && fwd.ends_with("exit $__vals_rc"));
+        assert!(fwd.starts_with("eval 'echo hi' < /dev/null; __valve_rc=$?;"), "{fwd}");
+        assert!(fwd.contains(CWD_MARKER) && fwd.ends_with("exit $__valve_rc"));
         assert_eq!(file.as_deref(), Some("/tmp/claude-1-cwd"));
         assert_eq!(forwardable("ls; eval 'x'"), ("ls; eval 'x'".to_string(), None));
-        assert_eq!(split_cwd("out\n__VALS_CWD__/app/sub\n"), ("out", Some("/app/sub")));
+        assert_eq!(split_cwd("out\n__VALVE_CWD__/app/sub\n"), ("out", Some("/app/sub")));
         assert_eq!(split_cwd("plain"), ("plain", None));
     }
 

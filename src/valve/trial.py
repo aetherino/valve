@@ -15,17 +15,17 @@ import time
 from pathlib import Path
 from typing import Any
 
-from vals_harness.benchmarks import make_benchmark
-from vals_harness.chamber_api import AgentOutcome, ChamberApi
-from vals_harness.errors import InfraError
-from vals_harness.installed import InstalledRunner
-from vals_harness.phantom import PhantomLauncher
-from vals_harness.phantom import create_volumes as phantom_volumes
-from vals_harness.phantom import remove_volumes as remove_phantom_volumes
-from vals_harness.launchers import AgentLauncher, DockerLauncher, HostLauncher
-from vals_harness.sandbox import SandboxProvider
-from vals_harness.specs import TrialSpec, folder_digest, missing_secrets
-from vals_harness.store import Claim, LostLease, Store
+from valve.benchmarks import make_benchmark
+from valve.chamber_api import AgentOutcome, ChamberApi
+from valve.errors import InfraError
+from valve.installed import InstalledRunner
+from valve.phantom import PhantomLauncher
+from valve.phantom import create_volumes as phantom_volumes
+from valve.phantom import remove_volumes as remove_phantom_volumes
+from valve.launchers import AgentLauncher, DockerLauncher, HostLauncher
+from valve.sandbox import SandboxProvider
+from valve.specs import TrialSpec, folder_digest, missing_secrets
+from valve.store import Claim, LostLease, Store
 
 
 
@@ -75,8 +75,8 @@ class TrialRunner:
         folder = self.artifacts_root / spec.run_id / spec.trial_id / f"try{claim.try_no}"
         folder.mkdir(parents=True, exist_ok=True)
         rec = TrialRecorder(self.store, spec.trial_id, claim.try_no, folder)
-        labels = {"vals.trial_id": spec.trial_id, "vals.run_id": spec.run_id, "vals.claim": claim.token,
-                  "vals.home": self.store.home_id}
+        labels = {"valve.trial_id": spec.trial_id, "valve.run_id": spec.run_id, "valve.claim": claim.token,
+                  "valve.home": self.store.home_id}
         t0 = time.monotonic()
         timings: dict[str, float] = {}
         outcome: AgentOutcome | None = None
@@ -120,7 +120,7 @@ class TrialRunner:
                        if placement == "phantom" and spec.agent.link == "volumes" else None)
             grade = vr = None
             # Created from a pinned image id, so a tag can't move under a running trial.
-            with self.provider.create(chamber_image, labels={**labels, "vals.role": "chamber"},
+            with self.provider.create(chamber_image, labels={**labels, "valve.role": "chamber"},
                                       network=network, cpus=spec.limits.cpus, memory=spec.limits.memory,
                                       volumes=volumes, workdir=workspace) as chamber:
                 if any(prepared.visible_dir.iterdir()):
@@ -170,7 +170,7 @@ class TrialRunner:
         except Exception as e:  # a harness bug is still a harness failure, never the agent's
             result = {"status": "infra_error", "error": {"kind": "adapter", "message": f"{type(e).__name__}: {e}"}}
         finally:
-            self.provider.reap({"vals.claim": claim.token})
+            self.provider.reap({"valve.claim": claim.token})
             if spec.agent.placement == "phantom":
                 remove_phantom_volumes(claim.token)
             rec.close()
